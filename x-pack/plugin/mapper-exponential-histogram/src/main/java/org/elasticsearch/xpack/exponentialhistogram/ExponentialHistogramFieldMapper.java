@@ -7,12 +7,12 @@
 
 package org.elasticsearch.xpack.exponentialhistogram;
 
-import org.apache.lucene.document.BinaryDocValuesField;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.NumericDocValuesField;
-import org.apache.lucene.index.BinaryDocValues;
+import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.NumericUtils;
@@ -340,7 +340,7 @@ public class ExponentialHistogramFieldMapper extends FieldMapper {
             CompressedExponentialHistogram.writeHistogramBytes(histogramBytesOutput, scale, negativeBuckets, positiveBuckets);
             BytesRef histoBytes = histogramBytesOutput.bytes().toBytesRef();
 
-            Field histoField = new BinaryDocValuesField(fullPath(), histoBytes);
+            Field histoField = new SortedDocValuesField(fullPath(), histoBytes);
             long thresholdAsLong = NumericUtils.doubleToSortableLong(zeroBucket.threshold());
             NumericDocValuesField zeroThresholdField = new NumericDocValuesField(zeroThresholdSubFieldName(fullPath()), thresholdAsLong);
             NumericDocValuesField valuesCountField = new NumericDocValuesField(valuesCountSubFieldName(fullPath()), totalValueCount);
@@ -586,7 +586,7 @@ public class ExponentialHistogramFieldMapper extends FieldMapper {
         @Override
         public SourceLoader.SyntheticFieldLoader.DocValuesLoader docValuesLoader(LeafReader leafReader, int[] docIdsInLeaf)
             throws IOException {
-            BinaryDocValues histoDocValues = leafReader.getBinaryDocValues(fieldType().name());
+            SortedDocValues histoDocValues = leafReader.getSortedDocValues(fieldType().name());
             if (histoDocValues == null) {
                 // No values in this leaf
                 binaryValue = null;
@@ -603,7 +603,7 @@ public class ExponentialHistogramFieldMapper extends FieldMapper {
                     boolean valueCountsPresent = valueCounts.advanceExact(docId);
                     assert zeroThresholdPresent && valueCountsPresent;
 
-                    binaryValue = histoDocValues.binaryValue();
+                    binaryValue = histoDocValues.lookupOrd(histoDocValues.ordValue());
                     zeroThreshold = NumericUtils.sortableLongToDouble(zeroThresholds.longValue());
                     valueCount = valueCounts.longValue();
                     return true;
