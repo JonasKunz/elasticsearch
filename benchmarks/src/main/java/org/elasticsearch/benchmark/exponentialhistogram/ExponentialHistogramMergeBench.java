@@ -47,7 +47,7 @@ import java.util.concurrent.TimeUnit;
 @State(Scope.Thread)
 public class ExponentialHistogramMergeBench {
 
-    @Param({ "1000", "2000", "5000" })
+    @Param({ "250", "500", "1000", "2000", "5000" })
     int bucketCount;
 
     @Param({ "0.01", "0.1", "0.25", "0.5", "1.0", "2.0" })
