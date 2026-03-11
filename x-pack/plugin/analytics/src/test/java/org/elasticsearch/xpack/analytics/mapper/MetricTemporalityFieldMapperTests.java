@@ -6,10 +6,9 @@
  */
 package org.elasticsearch.xpack.analytics.mapper;
 
-import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.util.BytesRef;
-import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.mapper.DocumentMapper;
 import org.elasticsearch.index.mapper.DocumentParsingException;
 import org.elasticsearch.index.mapper.MappedFieldType;
@@ -18,7 +17,6 @@ import org.elasticsearch.index.mapper.MapperParsingException;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.mapper.MapperTestCase;
 import org.elasticsearch.index.mapper.ParsedDocument;
-import org.elasticsearch.index.termvectors.TermVectorsService;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xpack.analytics.AnalyticsPlugin;
@@ -31,7 +29,6 @@ import java.util.List;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 
@@ -54,6 +51,21 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
     protected void minimalMapping(XContentBuilder b) throws IOException {
         b.field("type", MetricTemporalityFieldMapper.CONTENT_TYPE);
         b.field("time_series_dimension", true);
+    }
+
+    @Override
+    protected boolean supportsStoredFields() {
+        return false;
+    }
+
+    @Override
+    protected void enableDocValuesOnMapping(XContentBuilder mapping) throws IOException {
+        // noop, doc values are always enabled for this field type
+    }
+
+    @Override
+    public void testMinimalIsInvalidInRoutingPath() throws IOException {
+        assumeTrue("metric_temporality field is always a dimension, so it is always valid in the routing path", false);
     }
 
     @Override
@@ -87,10 +99,10 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
                 "Unknown value [unknown] for field [metric_temporality] - accepted values are [delta, cumulative]"
             ),
             exampleMalformedValue(b -> b.value(123)).errorMatches(
-                "Unknown value [123] for field [metric_temporality] - accepted values are [delta, cumulative]"
+                "Failed to parse object: expecting token of type [VALUE_STRING] but found [VALUE_NUMBER]"
             ),
-            exampleMalformedValue(b -> b.startArray().value("cumulative").value("delta").endArray()).errorMatches(
-                "type [metric_temporality] doesn't support indexing multiple values for the same field in the same document"
+            exampleMalformedValue(b -> b.startObject().field("foo", 42).endObject()).errorMatches(
+                "Failed to parse object: expecting token of type [VALUE_STRING] but found [START_OBJECT]"
             )
         );
     }
@@ -105,8 +117,9 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
         return new SyntheticSourceSupport() {
             @Override
             public SyntheticSourceExample example(int maxValues) throws IOException {
-                Tuple<String, String> value = randomCaseTemporality();
-                return new SyntheticSourceExample(value.v1(), value.v2(), this::mapping);
+                String input = randomCaseTemporality();
+                String canonical = input.toLowerCase();
+                return new SyntheticSourceExample(input, canonical, this::mapping);
             }
 
             private void mapping(XContentBuilder b) throws IOException {
@@ -124,30 +137,22 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
         };
     }
 
-    private Tuple<String, String> randomCaseTemporality() {
+    private String randomCaseTemporality() {
         String canonical = randomBoolean() ? "delta" : "cumulative";
-        String input = randomBoolean() ? canonical.toUpperCase(java.util.Locale.ROOT) : canonical;
-        return Tuple.tuple(input, canonical);
+        if (randomBoolean()) {
+            return canonical;
+        }
+        // upper case a random character to add some variability
+        char[] chars = canonical.toCharArray();
+        int indexToUpper = randomInt(chars.length - 1);
+        chars[indexToUpper] = Character.toUpperCase(chars[indexToUpper]);
+        return new String(chars);
+
     }
 
     @Override
     protected IngestScriptSupport ingestScriptSupport() {
         throw new AssumptionViolatedException("not supported");
-    }
-
-    @Override
-    protected boolean supportsStoredFields() {
-        return false;
-    }
-
-    @Override
-    protected boolean supportsSearchLookup() {
-        return false;
-    }
-
-    @Override
-    protected boolean dedupAfterFetch() {
-        return true;
     }
 
     public void testDimensionMustBeExplicitlyTrue() {
@@ -162,14 +167,14 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
     }
 
     public void testDisallowNonDimension() {
-        Exception e = expectThrows(
-            MapperParsingException.class,
-            () -> createMapperService(fieldMapping(b -> {
-                b.field("type", MetricTemporalityFieldMapper.CONTENT_TYPE);
-                b.field("time_series_dimension", false);
-            }))
+        Exception e = expectThrows(MapperParsingException.class, () -> createMapperService(fieldMapping(b -> {
+            b.field("type", MetricTemporalityFieldMapper.CONTENT_TYPE);
+            b.field("time_series_dimension", false);
+        })));
+        assertThat(
+            e.getCause().getMessage(),
+            containsString("Field type [metric_temporality] requires [time_series_dimension] to be [true]")
         );
-        assertThat(e.getCause().getMessage(), containsString("Field type [metric_temporality] requires [time_series_dimension] to be [true]"));
     }
 
     public void testInheritsDimensionFromPassThroughObject() throws IOException {
@@ -225,7 +230,10 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
 
     public void testRejectUnknownValue() throws IOException {
         DocumentMapper mapper = createDocumentMapper(fieldMapping(this::minimalMapping));
-        DocumentParsingException e = expectThrows(DocumentParsingException.class, () -> mapper.parse(source(b -> b.field("field", "gauge"))));
+        DocumentParsingException e = expectThrows(
+            DocumentParsingException.class,
+            () -> mapper.parse(source(b -> b.field("field", "gauge")))
+        );
         assertThat(e.getCause().getMessage(), containsString("accepted values are [delta, cumulative]"));
     }
 
@@ -260,19 +268,19 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
         assertThat(e.getCause().getMessage(), containsString("doesn't support indexing multiple values for the same field"));
     }
 
-    public void testIgnoresArrayValuesWhenIgnoreMalformedIsTrue() throws IOException {
+    public void testRejectsArrayValuesWhenIgnoreMalformedIsTrue() throws IOException {
         DocumentMapper mapper = createDocumentMapper(fieldMapping(b -> {
             b.field("type", MetricTemporalityFieldMapper.CONTENT_TYPE);
             b.field("time_series_dimension", true);
             b.field("ignore_malformed", true);
         }));
-        ParsedDocument doc = mapper.parse(source(b -> {
+        DocumentParsingException e = expectThrows(DocumentParsingException.class, () -> mapper.parse(source(b -> {
             b.startArray("field");
             b.value("delta");
             b.value("cumulative");
             b.endArray();
-        }));
-        assertThat(doc.rootDoc().getField("field"), nullValue());
+        })));
+        assertThat(e.getCause().getMessage(), containsString("doesn't support indexing multiple values for the same field"));
     }
 
     public void testRejectsSubfieldInArrayOfObjects() throws IOException {
@@ -296,7 +304,7 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
         assertThat(e.getCause().getMessage(), containsString("doesn't support indexing multiple values for the same field"));
     }
 
-    public void testIgnoresSubfieldInArrayOfObjectsWhenIgnoreMalformedIsTrue() throws IOException {
+    public void testRejectsSubfieldInArrayOfObjectsWhenIgnoreMalformedIsTrue() throws IOException {
         DocumentMapper mapper = createDocumentMapper(mapping(b -> {
             b.startObject("field")
                 .field("type", "object")
@@ -309,16 +317,13 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
                 .endObject()
                 .endObject();
         }));
-        ParsedDocument doc = mapper.parse(source(b -> {
+        DocumentParsingException e = expectThrows(DocumentParsingException.class, () -> mapper.parse(source(b -> {
             b.startArray("field");
             b.startObject().field("temporality", "delta").endObject();
             b.startObject().field("temporality", "cumulative").endObject();
             b.endArray();
-        }));
-        IndexableField field = doc.rootDoc().getField("field.temporality");
-        assertThat(field, notNullValue());
-        assertThat(field.binaryValue(), equalTo(new BytesRef("delta")));
-        assertThat(TermVectorsService.getValues(doc.rootDoc().getFields("_ignored")), contains("field.temporality"));
+        })));
+        assertThat(e.getCause().getMessage(), containsString("doesn't support indexing multiple values for the same field"));
     }
 
     @Override
@@ -328,7 +333,7 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
 
     @Override
     public void testSyntheticSourceKeepArrays() {
-        // This mapper is single-valued and rejects arrays.
+        assumeFalse("This mapper is single-valued and rejects arrays.", false);
     }
 
     @Override
@@ -336,8 +341,4 @@ public class MetricTemporalityFieldMapperTests extends MapperTestCase {
         return List.of(new SortShortcutSupport(this::minimalMapping, this::writeField, true));
     }
 
-    @Override
-    protected boolean supportsDocValuesSkippers() {
-        return false;
-    }
 }
