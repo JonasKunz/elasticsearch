@@ -494,6 +494,7 @@ public final class CsvTestUtils {
         // for it, so the scaling_factor isn't available
         SCALED_FLOAT(s -> s == null ? null : scaledFloat(s, "100"), Double.class),
         KEYWORD(Object::toString, BytesRef.class),
+        METRIC_TEMPORALITY(Object::toString, BytesRef.class),
         TEXT(Object::toString, BytesRef.class),
         SEMANTIC_TEXT(Object::toString, BytesRef.class),
         IP(
@@ -564,7 +565,7 @@ public final class CsvTestUtils {
             LOOKUP.put("COUNTER_LONG", LONG);
             LOOKUP.put("COUNTER_DOUBLE", DOUBLE);
             LOOKUP.put("COUNTER_FLOAT", FLOAT);
-            LOOKUP.put("METRIC_TEMPORALITY", KEYWORD);
+            //LOOKUP.put("METRIC_TEMPORALITY", KEYWORD);
 
             // add also the types with short names
             LOOKUP.put("BOOL", BOOLEAN);

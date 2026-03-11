@@ -589,7 +589,7 @@ public final class CsvAssert {
                 x -> EsqlDataTypeConverter.dateRangeToString((LongRangeBlockBuilder.LongRange) x)
             );
             case INTEGER, LONG, DOUBLE, FLOAT, HALF_FLOAT, SCALED_FLOAT, KEYWORD, TEXT, SEMANTIC_TEXT, IP_RANGE, NULL, BOOLEAN,
-                DENSE_VECTOR, TDIGEST, UNSUPPORTED -> expectedValue;
+                DENSE_VECTOR, TDIGEST, METRIC_TEMPORALITY, UNSUPPORTED -> expectedValue;
         };
     }
 
