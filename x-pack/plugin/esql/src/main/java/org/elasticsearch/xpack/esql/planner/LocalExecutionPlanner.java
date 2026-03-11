@@ -559,7 +559,7 @@ public class LocalExecutionPlanner {
             elementTypes[channel] = PlannerUtils.toElementType(inverse.get(channel).type(), fieldExtractPreference);
             encoders[channel] = switch (inverse.get(channel).type()) {
                 case IP -> TopNEncoder.IP;
-                case TEXT, KEYWORD -> TopNEncoder.UTF8;
+                case TEXT, KEYWORD, METRIC_TEMPORALITY -> TopNEncoder.UTF8;
                 case VERSION -> TopNEncoder.VERSION;
                 case DOC_DATA_TYPE -> new DocVectorEncoder(context.shardContexts);
                 case BOOLEAN, NULL, BYTE, SHORT, INTEGER, LONG, DOUBLE, FLOAT, HALF_FLOAT, DATETIME, DATE_NANOS, DATE_PERIOD, TIME_DURATION,

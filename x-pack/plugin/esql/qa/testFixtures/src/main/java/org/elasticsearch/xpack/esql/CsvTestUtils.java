@@ -564,6 +564,7 @@ public final class CsvTestUtils {
             LOOKUP.put("COUNTER_LONG", LONG);
             LOOKUP.put("COUNTER_DOUBLE", DOUBLE);
             LOOKUP.put("COUNTER_FLOAT", FLOAT);
+            LOOKUP.put("METRIC_TEMPORALITY", KEYWORD);
 
             // add also the types with short names
             LOOKUP.put("BOOL", BOOLEAN);

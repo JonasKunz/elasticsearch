@@ -168,6 +168,12 @@ public class CsvTestsDataLoader {
         new TestDataset("k8s", "k8s-mappings.json", "k8s.csv").withSetting("k8s-settings.json"),
         new TestDataset("datenanos-k8s", "k8s-mappings-date_nanos.json", "k8s.csv", "k8s-settings.json"),
         new TestDataset("k8s-downsampled", "k8s-downsampled-mappings.json", "k8s-downsampled.csv", "k8s-downsampled-settings.json"),
+        new TestDataset(
+            "metric_temporality_tsdb",
+            "mapping-metric_temporality_tsdb.json",
+            "metric_temporality_tsdb.csv",
+            "metric_temporality_tsdb-settings.json"
+        ),
         new TestDataset("distances"),
         new TestDataset("addresses"),
         new TestDataset("books").withSetting("books-settings.json"),

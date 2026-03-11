@@ -235,11 +235,6 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
         }
 
         @Override
-        protected BytesRef indexedValueForSearch(Object value) {
-            return toNormalizedTemporality(value.toString());
-        }
-
-        @Override
         public Object valueForDisplay(Object value) {
             if (value == null) {
                 return null;
@@ -249,16 +244,18 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
 
         @Override
         public void validateMatchedRoutingPath(String routingPath) {
-            throw new IllegalArgumentException(
-                "All fields that match routing_path "
-                    + "must be configured with [time_series_dimension: true] "
-                    + "or flattened fields with a list of dimensions in [time_series_dimensions] and "
-                    + "without the [script] parameter. ["
-                    + name()
-                    + "] was ["
-                    + typeName()
-                    + "]."
-            );
+            if (isDimension == false) {
+                throw new IllegalArgumentException(
+                    "All fields that match routing_path "
+                        + "must be configured with [time_series_dimension: true] "
+                        + "or flattened fields with a list of dimensions in [time_series_dimensions] and "
+                        + "without the [script] parameter. ["
+                        + name()
+                        + "] was ["
+                        + typeName()
+                        + "]."
+                );
+            }
         }
     }
 

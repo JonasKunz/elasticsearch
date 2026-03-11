@@ -1,0 +1,5 @@
+@timestamp:date,hostname:keyword,temporality:metric_temporality,cpu.time:counter_long
+2024-05-10T00:00:01.000Z,node-A,delta,100
+2024-05-10T00:00:02.000Z,node-B,cumulative,210
+2024-05-10T00:00:03.000Z,node-A,delta,330
+2024-05-10T00:00:04.000Z,node-C,cumulative,490

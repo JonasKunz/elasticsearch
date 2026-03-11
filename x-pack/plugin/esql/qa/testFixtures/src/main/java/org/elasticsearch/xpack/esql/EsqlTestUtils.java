@@ -1081,6 +1081,7 @@ public final class EsqlTestUtils {
             case FLOAT -> randomFloat();
             case HALF_FLOAT -> HalfFloatPoint.sortableShortToHalfFloat(HalfFloatPoint.halfFloatToSortableShort(randomFloat()));
             case KEYWORD -> new BytesRef(randomAlphaOfLength(5));
+            case METRIC_TEMPORALITY -> new BytesRef(randomBoolean() ? "delta" : "cumulative");
             case IP -> new BytesRef(InetAddressPoint.encode(randomIp(randomBoolean())));
             case TIME_DURATION -> Duration.ofMillis(randomLongBetween(-604800000L, 604800000L)); // plus/minus 7 days
             case TEXT -> new BytesRef(randomAlphaOfLength(50));

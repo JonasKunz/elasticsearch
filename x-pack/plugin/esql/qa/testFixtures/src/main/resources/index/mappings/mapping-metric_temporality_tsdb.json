@@ -1,0 +1,25 @@
+{
+  "properties": {
+    "@timestamp": {
+      "type": "date"
+    },
+    "hostname": {
+      "type": "keyword",
+      "time_series_dimension": true
+    },
+    "temporality": {
+      "type": "metric_temporality",
+      "time_series_dimension": true,
+      "index": true
+    },
+    "cpu": {
+      "properties": {
+        "time": {
+          "type": "long",
+          "time_series_metric": "counter",
+          "meta": { "unit": "ns" }
+        }
+      }
+    }
+  }
+}

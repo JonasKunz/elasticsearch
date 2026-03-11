@@ -217,7 +217,7 @@ public class Coalesce extends EsqlScalarFunction implements OptionalArgument {
                 toEvaluator,
                 children()
             );
-            case KEYWORD, TEXT, CARTESIAN_POINT, CARTESIAN_SHAPE, HISTOGRAM, GEO_POINT, GEO_SHAPE, IP, VERSION -> CoalesceBytesRefEvaluator
+            case KEYWORD, METRIC_TEMPORALITY, TEXT, CARTESIAN_POINT, CARTESIAN_SHAPE, HISTOGRAM, GEO_POINT, GEO_SHAPE, IP, VERSION -> CoalesceBytesRefEvaluator
                 .toEvaluator(toEvaluator, children());
             case EXPONENTIAL_HISTOGRAM -> CoalesceExponentialHistogramEvaluator.toEvaluator(toEvaluator, children());
             case TDIGEST -> CoalesceTDigestEvaluator.toEvaluator(toEvaluator, children());

@@ -1,0 +1,100 @@
+loadMetricTemporalityAsKeyword
+FROM metric_temporality_tsdb
+| KEEP temporality, hostname, cpu.time
+;
+ignoreOrder:true
+
+temporality:keyword | hostname:keyword | cpu.time:counter_long
+delta               | node-A           | 100
+cumulative          | node-B           | 210
+delta               | node-A           | 330
+cumulative          | node-C           | 490
+;
+
+metricTemporalityComparedToLiteral
+FROM metric_temporality_tsdb
+| WHERE temporality == "delta"
+| KEEP temporality, cpu.time
+;
+ignoreOrder:true
+
+temporality:keyword | cpu.time:counter_long
+delta               | 100
+delta               | 330
+;
+
+metricTemporalityComparedToUnknownLiteral
+FROM metric_temporality_tsdb
+| WHERE temporality == "foo"
+| KEEP temporality, cpu.time
+;
+
+temporality:keyword | cpu.time:counter_long
+;
+
+metricTemporalityComparedToKeywordField
+FROM metric_temporality_tsdb
+| WHERE temporality == hostname
+| KEEP temporality, hostname, cpu.time
+;
+ignoreOrder:true
+
+temporality:keyword | hostname:keyword | cpu.time:counter_long
+;
+
+metricTemporalityUsedInConcat
+FROM metric_temporality_tsdb
+| EVAL label = CONCAT(temporality, "-", hostname)
+| KEEP temporality, hostname, label
+| SORT label;
+
+temporality:keyword | hostname:keyword | label:keyword
+cumulative          | node-B           | cumulative-node-B
+cumulative          | node-C           | cumulative-node-C
+delta               | node-A           | delta-node-A
+delta               | node-A           | delta-node-A
+;
+
+metricTemporalitySortLimitTopN
+FROM metric_temporality_tsdb
+| SORT temporality ASC, hostname ASC
+| LIMIT 2
+| KEEP temporality, hostname, cpu.time;
+
+temporality:keyword | hostname:keyword | cpu.time:counter_long
+cumulative          | node-B           | 210
+cumulative          | node-C           | 490
+;
+
+metricTemporalityGroupBy
+FROM metric_temporality_tsdb
+| STATS docs = COUNT(*) BY temporality
+| SORT temporality;
+
+docs:long | temporality:keyword
+2         | cumulative
+2         | delta
+;
+
+metricTemporalityAggregations
+FROM metric_temporality_tsdb
+| STATS min_temporality = MIN(temporality), max_temporality = MAX(temporality), distinct_temporality = COUNT_DISTINCT(temporality);
+
+min_temporality:keyword | max_temporality:keyword | distinct_temporality:long
+cumulative              | delta                   | 2
+;
+
+metricTemporalityFunctions
+FROM metric_temporality_tsdb
+| EVAL as_string = TO_STRING(temporality)
+| EVAL starts_with_c = STARTS_WITH(as_string, "c")
+| EVAL label = CONCAT(as_string, ":", hostname), fallback = COALESCE(as_string, "missing")
+| KEEP temporality, as_string, starts_with_c, label, fallback
+| SORT label;
+
+temporality:keyword | as_string:keyword | starts_with_c:boolean | label:keyword        | fallback:keyword
+cumulative          | cumulative        | true                  | cumulative:node-B    | cumulative
+cumulative          | cumulative        | true                  | cumulative:node-C    | cumulative
+delta               | delta             | false                 | delta:node-A         | delta
+delta               | delta             | false                 | delta:node-A         | delta
+;

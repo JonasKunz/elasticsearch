@@ -288,6 +288,13 @@ public enum DataType implements Writeable {
      */
     KEYWORD(builder().esType("keyword").estimatedSize(50).docValues().supportedOnAllNodes()),
     /**
+     * String fields that only accept metric temporalities ("delta" or "cumulative")
+     * and widen to {@link #KEYWORD} in ES|QL.
+     */
+    METRIC_TEMPORALITY(
+        builder().esType("metric_temporality").estimatedSize(50).docValues().widenSmallNumeric(KEYWORD).supportedOnAllNodes()
+    ),
+    /**
      * String fields that are analyzed when the document is received and may be
      * cut into more than one token. Generally ESQL only sees {@code text} fields
      * when loaded from the index and ESQL will load these fields
