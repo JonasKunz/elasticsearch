@@ -7,7 +7,6 @@
 package org.elasticsearch.xpack.analytics.mapper;
 
 import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.InvertableType;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.IndexOptions;
@@ -51,7 +50,8 @@ import java.util.Set;
 import static org.elasticsearch.index.mapper.FieldMapper.Parameter.useTimeSeriesDocValuesSkippers;
 
 /**
- * A keyword-like field that only accepts "delta" and "cumulative".
+ * A keyword-like field that only accepts "delta" and "cumulative" as values.
+ * In addition, it doesn't allow multiple values for the same field in the same document.
  */
 public class MetricTemporalityFieldMapper extends FieldMapper {
 
@@ -65,20 +65,6 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
 
     private static MetricTemporalityFieldMapper toType(FieldMapper in) {
         return (MetricTemporalityFieldMapper) in;
-    }
-
-    /**
-     * Lightweight field wrapper mirroring keyword's binary invertable behavior.
-     */
-    private static final class MetricTemporalityField extends org.apache.lucene.document.Field {
-        private MetricTemporalityField(String field, BytesRef term, FieldType ft) {
-            super(field, term, ft);
-        }
-
-        @Override
-        public InvertableType invertableType() {
-            return InvertableType.BINARY;
-        }
     }
 
     static class Builder extends FieldMapper.DimensionBuilder {
@@ -151,7 +137,7 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
             }
             if (dimension.getValue() == false) {
                 throw new IllegalArgumentException(
-                    "Field type [" + CONTENT_TYPE + "] requires [" + TimeSeriesParams.TIME_SERIES_DIMENSION_PARAM + "] to be [true]"
+                    "Field type [" + CONTENT_TYPE + "] requires [" + dimension.name + "] to be [true]"
                 );
             }
             FieldType fieldType = buildFieldType();
@@ -164,8 +150,7 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
                     context.buildFullName(leafName()),
                     IndexType.terms(fieldType),
                     textSearchInfo,
-                    meta.getValue(),
-                    dimension.getValue()
+                    meta.getValue()
                 ),
                 fieldType,
                 builderParams(this, context),
@@ -180,11 +165,9 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
     );
 
     static final class MetricTemporalityFieldType extends StringFieldType {
-        private final boolean isDimension;
 
-        MetricTemporalityFieldType(String name, IndexType indexType, TextSearchInfo textSearchInfo, Map<String, String> meta, boolean isDimension) {
+        MetricTemporalityFieldType(String name, IndexType indexType, TextSearchInfo textSearchInfo, Map<String, String> meta) {
             super(name, indexType, false, textSearchInfo, meta);
-            this.isDimension = isDimension;
         }
 
         @Override
@@ -193,13 +176,8 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
         }
 
         @Override
-        public String familyTypeName() {
-            return KeywordFieldMapper.CONTENT_TYPE;
-        }
-
-        @Override
         public boolean isDimension() {
-            return isDimension;
+            return true;
         }
 
         @Override
@@ -230,36 +208,6 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
                 CoreValuesSourceType.KEYWORD,
                 (dv, n) -> new KeywordDocValuesField(FieldData.toString(dv), n)
             );
-        }
-
-        @Override
-        public BlockLoader blockLoader(BlockLoaderContext blContext) {
-            failIfNoDocValues();
-            return new BytesRefsFromOrdsBlockLoader(name(), blContext.ordinalsByteSize());
-        }
-
-        @Override
-        public Object valueForDisplay(Object value) {
-            if (value == null) {
-                return null;
-            }
-            return ((BytesRef) value).utf8ToString();
-        }
-
-        @Override
-        public void validateMatchedRoutingPath(String routingPath) {
-            if (isDimension == false) {
-                throw new IllegalArgumentException(
-                    "All fields that match routing_path "
-                        + "must be configured with [time_series_dimension: true] "
-                        + "or flattened fields with a list of dimensions in [time_series_dimensions] and "
-                        + "without the [script] parameter. ["
-                        + name()
-                        + "] was ["
-                        + typeName()
-                        + "]."
-                );
-            }
         }
     }
 
@@ -319,31 +267,24 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
         if (parser.currentToken() == XContentParser.Token.VALUE_NULL) {
             return;
         }
-        if (context.isImmediateParentAnArray() || context.doc().getField(fieldType().name()) != null) {
-            if (ignoreMalformed.value() == false) {
-                throw new IllegalArgumentException(
-                    "Field ["
-                        + fullPath()
-                        + "] of type ["
-                        + typeName()
-                        + "] doesn't support indexing multiple values for the same field in the same document"
-                );
-            }
-            recordIgnoredMalformedValue(context, parser);
-            return;
+        if (context.doc().getField(fieldType().name()) != null) {
+            throw new IllegalArgumentException(
+                "Field ["
+                + fullPath()
+                + "] of type ["
+                + typeName()
+                + "] doesn't support indexing multiple values for the same field in the same document"
+            );
         }
-
-        if (ignoreMalformed.value() == false) {
-            BytesRef normalizedValue = toNormalizedTemporality(parser.text());
-            indexValue(context, normalizedValue);
-            return;
-        }
-
         try {
-            BytesRef normalizedValue = toNormalizedTemporality(parser.text());
+            BytesRef normalizedValue = normalizeTemporalityAsBytes(parser.text());
             indexValue(context, normalizedValue);
         } catch (Exception e) {
-            recordIgnoredMalformedValue(context, parser);
+            if (ignoreMalformed()) {
+                recordIgnoredMalformedValue(context, parser);
+            } else {
+                throw e;
+            }
         }
     }
 
@@ -358,7 +299,7 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
     }
 
     private void indexValue(DocumentParserContext context, BytesRef value) {
-        context.doc().add(new MetricTemporalityField(fieldType().name(), value, fieldType));
+        context.doc().add(new KeywordFieldMapper.KeywordField(fieldType().name(), value, fieldType));
         if (fieldType().isDimension()) {
             context.getRoutingFields().addString(fieldType().name(), value);
         }
@@ -386,7 +327,7 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
         );
     }
 
-    static BytesRef toNormalizedTemporality(String value) {
+    private static BytesRef normalizeTemporalityAsBytes(String value) {
         if (DELTA.equalsIgnoreCase(value)) {
             return DELTA_BYTES;
         }
@@ -398,7 +339,7 @@ public class MetricTemporalityFieldMapper extends FieldMapper {
         );
     }
 
-    static String normalizeTemporality(String value) {
-        return toNormalizedTemporality(value) == DELTA_BYTES ? DELTA : CUMULATIVE;
+    private static String normalizeTemporality(String value) {
+        return normalizeTemporalityAsBytes(value) == DELTA_BYTES ? DELTA : CUMULATIVE;
     }
 }
