@@ -11,6 +11,16 @@ import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.Meter;
 import io.opentelemetry.exporter.otlp.http.metrics.OtlpHttpMetricExporter;
+import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest;
+import io.opentelemetry.proto.common.v1.AnyValue;
+import io.opentelemetry.proto.common.v1.InstrumentationScope;
+import io.opentelemetry.proto.common.v1.KeyValue;
+import io.opentelemetry.proto.metrics.v1.Exemplar;
+import io.opentelemetry.proto.metrics.v1.Gauge;
+import io.opentelemetry.proto.metrics.v1.Metric;
+import io.opentelemetry.proto.metrics.v1.NumberDataPoint;
+import io.opentelemetry.proto.metrics.v1.ResourceMetrics;
+import io.opentelemetry.proto.metrics.v1.ScopeMetrics;
 import io.opentelemetry.sdk.common.Clock;
 import io.opentelemetry.sdk.common.CompletableResultCode;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
@@ -29,7 +39,12 @@ import io.opentelemetry.sdk.metrics.internal.data.ImmutableMetricData;
 import io.opentelemetry.sdk.metrics.internal.data.ImmutableSumData;
 import io.opentelemetry.sdk.resources.Resource;
 
+import com.google.protobuf.ByteString;
+
+import org.apache.http.entity.ByteArrayEntity;
+import org.apache.http.entity.ContentType;
 import org.elasticsearch.client.Request;
+import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.common.hash.BufferedMurmur3Hasher;
 import org.elasticsearch.test.rest.ObjectPath;
 import org.junit.After;
@@ -58,6 +73,18 @@ import static org.hamcrest.Matchers.isA;
 import static org.hamcrest.Matchers.not;
 
 public class OTLPMetricsIndexingRestIT extends AbstractOTLPIndexingRestIT {
+
+    private static final byte[] EXEMPLAR_TRACE_ID = new byte[16];
+    private static final byte[] EXEMPLAR_SPAN_ID = new byte[8];
+
+    static {
+        for (int i = 0; i < EXEMPLAR_TRACE_ID.length; i++) {
+            EXEMPLAR_TRACE_ID[i] = (byte) i;
+        }
+        for (int i = 0; i < EXEMPLAR_SPAN_ID.length; i++) {
+            EXEMPLAR_SPAN_ID[i] = (byte) (16 + i);
+        }
+    }
 
     private OtlpHttpMetricExporter exporter;
     private SdkMeterProvider meterProvider;
@@ -100,7 +127,9 @@ public class OTLPMetricsIndexingRestIT extends AbstractOTLPIndexingRestIT {
 
     @After
     public void closeMeterProvider() throws Exception {
-        meterProvider.close();
+        if (meterProvider != null) {
+            meterProvider.close();
+        }
     }
 
     public void testIngestMetricViaMeterProvider() throws Exception {
@@ -145,6 +174,85 @@ public class OTLPMetricsIndexingRestIT extends AbstractOTLPIndexingRestIT {
         assertThat(evaluate(source, "temporality"), equalTo(null));
         assertThat(evaluate(source, "resource.attributes.service\\.name"), equalTo("elasticsearch"));
         assertThat(evaluate(source, "scope.name"), equalTo("io.opentelemetry.example.metrics"));
+    }
+
+    public void testIngestExemplarViaOtlpProtobuf() throws Exception {
+        String metricName = "exemplar.restit." + randomAlphaOfLength(12);
+        long dataPointTimestamp = 1_704_067_713_467_654_000L;
+        long exemplarTimestamp = 1_704_067_713_467_655_123L;
+        double exemplarValue = 42.5;
+
+        ExportMetricsServiceRequest request = buildGaugeWithExemplarRequest(
+            metricName,
+            dataPointTimestamp,
+            exemplarTimestamp,
+            exemplarValue,
+            EXEMPLAR_TRACE_ID,
+            EXEMPLAR_SPAN_ID,
+            "http.route",
+            "/checkout"
+        );
+
+        Request otlpRequest = new Request("POST", otlpEndpointPath());
+        otlpRequest.setEntity(new ByteArrayEntity(request.toByteArray(), ContentType.create("application/x-protobuf")));
+        otlpRequest.setOptions(
+            RequestOptions.DEFAULT.toBuilder().addHeader("Authorization", "ApiKey " + createApiKey("metrics-*")).build()
+        );
+        assertOK(client().performRequest(otlpRequest));
+
+        refreshExemplarIndices();
+
+        ObjectPath search = search("metrics-generic.otel-default::exemplars", """
+            {
+              "query": {
+                "term": {
+                  "metric.name": "$METRIC_NAME"
+                }
+              }
+            }
+            """.replace("$METRIC_NAME", metricName));
+        assertThat(search.evaluate("hits.total.value"), equalTo(1));
+        var source = search.evaluate("hits.hits.0._source");
+        assertThat(
+            Instant.parse(evaluate(source, "@timestamp")),
+            equalTo(Instant.ofEpochMilli(TimeUnit.NANOSECONDS.toMillis(exemplarTimestamp)))
+        );
+        assertThat(evaluate(source, "metric\\.name"), equalTo(metricName));
+        assertThat(evaluate(source, "trace_id"), equalTo("000102030405060708090a0b0c0d0e0f"));
+        assertThat(evaluate(source, "span_id"), equalTo("1011121314151617"));
+        assertThat(ObjectPath.<Number>evaluate(source, "value").doubleValue(), equalTo(exemplarValue));
+        assertThat(evaluate(source, "filtered_attributes\\.http\\.route"), equalTo("/checkout"));
+        assertThat(evaluate(source, "unit"), equalTo("s"));
+        assertThat(evaluate(source, "_dimensions_hash"), isA(String.class));
+
+        Request esqlRequest = new Request("POST", "/_query");
+        esqlRequest.setJsonEntity("""
+            {
+              "query": "FROM metrics-generic.otel-default::exemplars \
+            | WHERE metric.name == \\"$METRIC_NAME\\" \
+            | KEEP @timestamp, metric.name, trace_id, span_id, value, filtered_attributes.http.route, service.name, scope.name, unit \
+            | LIMIT 1"
+            }
+            """.replace("$METRIC_NAME", metricName));
+        ObjectPath esqlResponse = ObjectPath.createFromResponse(client().performRequest(esqlRequest));
+        assertThat(
+            esqlResponse.evaluate("values"),
+            equalTo(
+                List.of(
+                    List.of(
+                        "2024-01-01T00:08:33.467Z",
+                        metricName,
+                        "000102030405060708090a0b0c0d0e0f",
+                        "1011121314151617",
+                        exemplarValue,
+                        "/checkout",
+                        "elasticsearch",
+                        "io.opentelemetry.example.metrics",
+                        "s"
+                    )
+                )
+            )
+        );
     }
 
     public void testGroupingSameGroup() throws Exception {
@@ -800,5 +908,60 @@ public class OTLPMetricsIndexingRestIT extends AbstractOTLPIndexingRestIT {
                 )
             )
         );
+    }
+
+    private static void refreshExemplarIndices() throws IOException {
+        assertOK(client().performRequest(new Request("POST", "metrics-generic.otel-default::exemplars/_refresh")));
+    }
+
+    private static ExportMetricsServiceRequest buildGaugeWithExemplarRequest(
+        String metricName,
+        long dataPointTimestamp,
+        long exemplarTimestamp,
+        double exemplarValue,
+        byte[] traceId,
+        byte[] spanId,
+        String filteredAttributeKey,
+        String filteredAttributeValue
+    ) {
+        Exemplar exemplar = Exemplar.newBuilder()
+            .setTimeUnixNano(exemplarTimestamp)
+            .setAsDouble(exemplarValue)
+            .setTraceId(ByteString.copyFrom(traceId))
+            .setSpanId(ByteString.copyFrom(spanId))
+            .addFilteredAttributes(protobufKeyValue(filteredAttributeKey, filteredAttributeValue))
+            .build();
+        NumberDataPoint dataPoint = NumberDataPoint.newBuilder()
+            .setTimeUnixNano(dataPointTimestamp)
+            .setStartTimeUnixNano(dataPointTimestamp)
+            .setAsDouble(1.0)
+            .addExemplars(exemplar)
+            .build();
+        Metric metric = Metric.newBuilder()
+            .setName(metricName)
+            .setUnit("s")
+            .setGauge(Gauge.newBuilder().addDataPoints(dataPoint).build())
+            .build();
+        return ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                ResourceMetrics.newBuilder()
+                    .setResource(
+                        io.opentelemetry.proto.resource.v1.Resource.newBuilder()
+                            .addAttributes(protobufKeyValue("service.name", "elasticsearch"))
+                            .build()
+                    )
+                    .addScopeMetrics(
+                        ScopeMetrics.newBuilder()
+                            .setScope(InstrumentationScope.newBuilder().setName("io.opentelemetry.example.metrics").build())
+                            .addMetrics(metric)
+                            .build()
+                    )
+                    .build()
+            )
+            .build();
+    }
+
+    private static KeyValue protobufKeyValue(String key, String value) {
+        return KeyValue.newBuilder().setKey(key).setValue(AnyValue.newBuilder().setStringValue(value).build()).build();
     }
 }

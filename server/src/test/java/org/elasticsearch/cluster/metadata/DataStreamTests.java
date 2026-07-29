@@ -111,11 +111,14 @@ public class DataStreamTests extends AbstractXContentSerializingTestCase<DataStr
         var lifecycle = instance.getDataLifecycle();
         var dataStreamOptions = instance.getDataStreamOptions();
         var failureIndices = instance.getFailureIndices();
+        var exemplarIndices = instance.getExemplarIndices();
         var rolloverOnWrite = instance.rolloverOnWrite();
         var autoShardingEvent = instance.getAutoShardingEvent();
         var failureRolloverOnWrite = instance.getFailureComponent().isRolloverOnWrite();
         var failureAutoShardingEvent = instance.getFailureComponent().getAutoShardingEvent();
-        switch (between(0, 17)) {
+        var exemplarRolloverOnWrite = instance.getExemplarComponent().isRolloverOnWrite();
+        var exemplarAutoShardingEvent = instance.getExemplarComponent().getAutoShardingEvent();
+        switch (between(0, 19)) {
             case 0 -> name = randomAlphaOfLength(10);
             case 1 -> indices = randomNonEmptyIndexInstances();
             case 2 -> generation = instance.getGeneration() + randomIntBetween(1, 10);
@@ -185,6 +188,11 @@ public class DataStreamTests extends AbstractXContentSerializingTestCase<DataStr
                 : new DataStreamAutoShardingEvent(indices.getLast().getName(), randomIntBetween(1, 10), randomMillisUpToYear9999());
             case 16 -> settings = randomValueOtherThan(settings, DataStreamTestHelper::randomSettings);
             case 17 -> mappings = randomValueOtherThan(mappings, ComponentTemplateTests::randomMappings);
+            case 18 -> exemplarIndices = randomValueOtherThan(exemplarIndices, DataStreamTestHelper::randomIndexInstances);
+            case 19 -> {
+                exemplarRolloverOnWrite = exemplarRolloverOnWrite == false;
+                isReplicated = exemplarRolloverOnWrite == false && isReplicated;
+            }
         }
 
         return new DataStream(
@@ -207,8 +215,61 @@ public class DataStreamTests extends AbstractXContentSerializingTestCase<DataStr
                 failureIndices,
                 failureRolloverOnWrite,
                 failureAutoShardingEvent
+            ),
+            new DataStream.DataStreamIndices(
+                DataStream.EXEMPLAR_STORE_PREFIX,
+                exemplarIndices,
+                exemplarRolloverOnWrite,
+                exemplarAutoShardingEvent
             )
         );
+    }
+
+    public void testExemplarStoreLazyRolloverOnWrite() {
+        DataStream ds = DataStreamTestHelper.newInstance(
+            "metrics",
+            List.of(new Index(DataStream.getDefaultBackingIndexName("metrics", 1, 0), "uuid")),
+            List.of(),
+            List.of()
+        );
+        assertTrue(ds.getExemplarComponent().isRolloverOnWrite());
+        assertNull(ds.getWriteExemplarIndex());
+    }
+
+    public void testRolloverExemplarStore() {
+        DataStream ds = DataStreamTestHelper.newInstance(
+            "metrics",
+            List.of(new Index(DataStream.getDefaultBackingIndexName("metrics", 1, 0), "uuid")),
+            List.of(),
+            List.of(new Index(DataStream.getDefaultExemplarStoreName("metrics", 1, 0), "uuid2"))
+        ).promoteDataStream();
+        final var project = ProjectMetadata.builder(randomProjectIdOrDefault()).build();
+        Tuple<String, Long> newCoordinates = ds.nextWriteIndexAndGeneration(project, ds.getExemplarComponent());
+        final DataStream rolledDs = ds.rolloverExemplarStore(new Index(newCoordinates.v1(), UUIDs.randomBase64UUID()), newCoordinates.v2());
+        assertThat(rolledDs.getExemplarIndices().size(), equalTo(ds.getExemplarIndices().size() + 1));
+        assertFalse(rolledDs.getExemplarComponent().isRolloverOnWrite());
+    }
+
+    public void testRemoveExemplarStoreIndex() {
+        DataStream original = DataStreamTestHelper.newInstance(
+            "metrics",
+            List.of(new Index(DataStream.getDefaultBackingIndexName("metrics", 1, 0), "uuid")),
+            List.of(),
+            DataStreamTestHelper.randomNonEmptyIndexInstances()
+        );
+        int indexToRemove = randomIntBetween(0, original.getExemplarIndices().size() - 1);
+        DataStream updated = original.removeExemplarStoreIndex(original.getExemplarIndices().get(indexToRemove));
+        assertThat(updated.getExemplarIndices().size(), equalTo(original.getExemplarIndices().size() - 1));
+    }
+
+    public void testIsExemplarStoreExplicitlyEnabled() {
+        DataStream enabled = DataStreamTestHelper.newInstance(
+            "metrics",
+            List.of(new Index(DataStream.getDefaultBackingIndexName("metrics", 1, 0), "uuid")),
+            List.of(),
+            List.of()
+        ).copy().setDataStreamOptions(new DataStreamOptions(null, new DataStreamExemplarStore(true, "exemplars-template"))).build();
+        assertTrue(enabled.isExemplarStoreExplicitlyEnabled());
     }
 
     public void testRollover() {

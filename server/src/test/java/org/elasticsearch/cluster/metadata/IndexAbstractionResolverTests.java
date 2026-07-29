@@ -138,6 +138,8 @@ public class IndexAbstractionResolverTests extends ESTestCase {
         // No selectors allowed, valid selector given
         expectThrows(IllegalArgumentException.class, () -> resolveAbstractionsSelectorNotAllowed(List.of("data-stream1::data")));
         // Selectors allowed, valid selector given
+        assertThat(resolveAbstractionsSelectorAllowed(List.of("data-stream1::exemplars")), contains("data-stream1::exemplars"));
+        // Selectors allowed, valid selector given
         assertThat(resolveAbstractionsSelectorAllowed(List.of("data-stream1::failures")), contains("data-stream1::failures"));
         // Selectors allowed, data selector is not added in result since it is the default
         assertThat(
@@ -215,10 +217,12 @@ public class IndexAbstractionResolverTests extends ESTestCase {
         assertThat(isIndexVisible("index1", "data"), is(true));
         assertThat(isIndexVisible("index1", "failures"), is(false)); // *
         // * Indices don't have failure components so the failure component is not visible
+        assertThat(isIndexVisible("index1", "exemplars"), is(false));
 
         assertThat(isIndexVisible("data-stream1", null), is(true));
         assertThat(isIndexVisible("data-stream1", "data"), is(true));
         assertThat(isIndexVisible("data-stream1", "failures"), is(true));
+        assertThat(isIndexVisible("data-stream1", "exemplars"), is(true));
 
         assertFalse(
             IndexAbstractionResolver.isIndexVisibleUnderConcreteAccess(

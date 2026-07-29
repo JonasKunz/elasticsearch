@@ -1,0 +1,32 @@
+version: ${xpack.oteldata.template.version}
+_meta:
+  description: Default mappings for OpenTelemetry metric exemplars installed by x-pack
+  managed: true
+template:
+  mappings:
+    properties:
+      metric:
+        properties:
+          name:
+            type: keyword
+            ignore_above: 1024
+      trace_id:
+        type: keyword
+        ignore_above: 32
+      span_id:
+        type: keyword
+        ignore_above: 16
+      value:
+        type: double
+      filtered_attributes:
+        type: passthrough
+        dynamic: true
+        priority: 20
+      _dimensions_hash:
+        type: keyword
+        ignore_above: 1024
+      unit:
+        type: keyword
+        ignore_above: 1024
+      temporality:
+        type: keyword

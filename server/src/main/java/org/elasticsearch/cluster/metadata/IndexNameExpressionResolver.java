@@ -81,12 +81,14 @@ public class IndexNameExpressionResolver {
     public static final String EXCLUDED_DATA_STREAMS_KEY = "es.excluded_ds";
     public static final IndexVersion SYSTEM_INDEX_ENFORCEMENT_INDEX_VERSION = IndexVersions.V_8_0_0;
 
-    private static final BiPredicate<DataStreamAlias, Boolean> ALL_DATA_STREAM_ALIASES = (ignoredAlias, ignoredIsData) -> true;
-    // Alias filters are not applied against indices in an abstraction's failure component.
+    private static final BiPredicate<DataStreamAlias, IndexComponentSelector> ALL_DATA_STREAM_ALIASES = (
+        ignoredAlias,
+        ignoredComponent) -> true;
+    // Alias filters are not applied against indices in an abstraction's failure or exemplar components.
     // They do not match the mapping of the data stream nor are the documents mapped for searching.
-    private static final BiPredicate<DataStreamAlias, Boolean> ONLY_FILTERING_DATA_STREAM_ALIASES = (
+    private static final BiPredicate<DataStreamAlias, IndexComponentSelector> ONLY_FILTERING_DATA_STREAM_ALIASES = (
         dataStreamAlias,
-        isData) -> dataStreamAlias.filteringRequired() && isData;
+        component) -> dataStreamAlias.filteringRequired() && IndexComponentSelector.DATA.equals(component);
 
     private final ThreadContext threadContext;
     private final SystemIndices systemIndices;
@@ -684,6 +686,12 @@ public class IndexNameExpressionResolver {
                         concreteIndicesResult.add(failureStoreWriteIndex);
                     }
                 }
+                if (shouldIncludeExemplarIndices(context.getOptions(), expression.selector())) {
+                    Index exemplarStoreWriteIndex = indexAbstraction.getWriteExemplarIndex(context.getProject());
+                    if (exemplarStoreWriteIndex != null && addIndex(exemplarStoreWriteIndex, null, context)) {
+                        concreteIndicesResult.add(exemplarStoreWriteIndex);
+                    }
+                }
             } else {
                 if (context.getOptions().allowAliasesToMultipleIndices() == false
                     && resolvesToMoreThanOneIndex(indexAbstraction, context, expression)) {
@@ -748,6 +756,15 @@ public class IndexNameExpressionResolver {
                 }
             }
         }
+        if (shouldIncludeExemplarIndices(context.getOptions(), selector)) {
+            List<Index> exemplarIndices = indexAbstraction.getExemplarIndices(context.getProject());
+            for (int i = 0, n = exemplarIndices.size(); i < n; i++) {
+                Index index = exemplarIndices.get(i);
+                if (shouldTrackConcreteIndex(context, index)) {
+                    concreteIndicesResult.add(index);
+                }
+            }
+        }
     }
 
     public static boolean shouldIncludeRegularIndices(IndicesOptions indicesOptions, IndexComponentSelector expressionSelector) {
@@ -763,6 +780,13 @@ public class IndexNameExpressionResolver {
             return expressionSelector != null && expressionSelector.shouldIncludeFailures();
         }
         return indicesOptions.includeFailureIndices();
+    }
+
+    public static boolean shouldIncludeExemplarIndices(IndicesOptions indicesOptions, IndexComponentSelector expressionSelector) {
+        if (indicesOptions.allowSelectors()) {
+            return expressionSelector != null && expressionSelector.shouldIncludeExemplars();
+        }
+        return false;
     }
 
     private static boolean resolvesToMoreThanOneIndex(IndexAbstraction indexAbstraction, Context context, ResolvedExpression expression) {
@@ -784,6 +808,9 @@ public class IndexNameExpressionResolver {
                     if (shouldIncludeFailureIndices(context.getOptions(), expression.selector())) {
                         count += parentDataStream.getFailureIndices().size();
                     }
+                    if (shouldIncludeExemplarIndices(context.getOptions(), expression.selector())) {
+                        count += parentDataStream.getExemplarIndices().size();
+                    }
                     if (count > 1) {
                         // Early out if we already have more than one index accounted
                         return true;
@@ -800,6 +827,9 @@ public class IndexNameExpressionResolver {
             }
             if (shouldIncludeFailureIndices(context.getOptions(), expression.selector())) {
                 count += dataStream.getFailureIndices().size();
+            }
+            if (shouldIncludeExemplarIndices(context.getOptions(), expression.selector())) {
+                count += dataStream.getExemplarIndices().size();
             }
             return count > 1;
         }
@@ -1138,7 +1168,7 @@ public class IndexNameExpressionResolver {
         ProjectMetadata project,
         String index,
         Predicate<AliasMetadata> requiredAlias,
-        BiPredicate<DataStreamAlias, Boolean> requiredDataStreamAlias,
+        BiPredicate<DataStreamAlias, IndexComponentSelector> requiredDataStreamAlias,
         boolean skipIdentity,
         Set<ResolvedExpression> resolvedExpressions
     ) {
@@ -1165,8 +1195,8 @@ public class IndexNameExpressionResolver {
         IndexAbstraction ia = project.getIndicesLookup().get(index);
         DataStream dataStream = ia.getParentDataStream();
         if (dataStream != null) {
-            boolean isData = dataStream.isFailureStoreIndex(index) == false;
-            if (skipIdentity == false && resolvedExpressionsContainsAbstraction(resolvedExpressions, dataStream.getName(), isData)) {
+            IndexComponentSelector component = backingIndexComponent(dataStream, index);
+            if (skipIdentity == false && resolvedExpressionsContainsAbstraction(resolvedExpressions, dataStream.getName(), component)) {
                 // skip the filters when the request targets the data stream name + selector directly
                 return null;
             }
@@ -1176,13 +1206,13 @@ public class IndexNameExpressionResolver {
                 aliasesForDataStream = dataStreamAliases.values()
                     .stream()
                     .filter(
-                        dataStreamAlias -> resolvedExpressionsContainsAbstraction(resolvedExpressions, dataStreamAlias.getName(), isData)
+                        dataStreamAlias -> resolvedExpressionsContainsAbstraction(resolvedExpressions, dataStreamAlias.getName(), component)
                     )
                     .filter(dataStreamAlias -> dataStreamAlias.getDataStreams().contains(dataStream.getName()))
                     .toList();
             } else {
                 aliasesForDataStream = resolvedExpressions.stream()
-                    .filter(expression -> (expression.selector() == null || expression.selector().shouldIncludeData()) == isData)
+                    .filter(expression -> expressionMatchesComponent(expression, component))
                     .map(ResolvedExpression::resource)
                     .map(dataStreamAliases::get)
                     .filter(dataStreamAlias -> dataStreamAlias != null && dataStreamAlias.getDataStreams().contains(dataStream.getName()))
@@ -1191,13 +1221,15 @@ public class IndexNameExpressionResolver {
 
             List<String> requiredAliases = null;
             for (DataStreamAlias dataStreamAlias : aliasesForDataStream) {
-                if (requiredDataStreamAlias.test(dataStreamAlias, isData)) {
+                if (requiredDataStreamAlias.test(dataStreamAlias, component)) {
                     if (requiredAliases == null) {
                         requiredAliases = new ArrayList<>(aliasesForDataStream.size());
                     }
-                    String alias = isData
-                        ? dataStreamAlias.getName()
-                        : combineSelector(dataStreamAlias.getName(), IndexComponentSelector.FAILURES);
+                    String alias = switch (component) {
+                        case DATA -> dataStreamAlias.getName();
+                        case FAILURES -> combineSelector(dataStreamAlias.getName(), IndexComponentSelector.FAILURES);
+                        case EXEMPLARS -> combineSelector(dataStreamAlias.getName(), IndexComponentSelector.EXEMPLARS);
+                    };
                     requiredAliases.add(alias);
                 } else {
                     // we have a non-required alias for this data stream so no need to check further
@@ -1220,7 +1252,7 @@ public class IndexNameExpressionResolver {
                 // Indices can only be referenced with a data selector, or a null selector if selectors are disabled
                 for (AliasMetadata aliasMetadata : indexAliases.values()) {
                     var alias = aliasMetadata.alias();
-                    if (resolvedExpressionsContainsAbstraction(resolvedExpressions, alias, true)) {
+                    if (resolvedExpressionsContainsAbstraction(resolvedExpressions, alias, IndexComponentSelector.DATA)) {
                         if (requiredAlias.test(aliasMetadata) == false) {
                             return null;
                         }
@@ -1243,16 +1275,36 @@ public class IndexNameExpressionResolver {
         }
     }
 
+    private static IndexComponentSelector backingIndexComponent(DataStream dataStream, String indexName) {
+        if (dataStream.isFailureStoreIndex(indexName)) {
+            return IndexComponentSelector.FAILURES;
+        }
+        if (dataStream.isExemplarStoreIndex(indexName)) {
+            return IndexComponentSelector.EXEMPLARS;
+        }
+        return IndexComponentSelector.DATA;
+    }
+
+    private static boolean expressionMatchesComponent(ResolvedExpression expression, IndexComponentSelector component) {
+        IndexComponentSelector expressionSelector = expression.selector();
+        if (expressionSelector == null) {
+            return component == IndexComponentSelector.DATA;
+        }
+        return expressionSelector == component;
+    }
+
     private static boolean resolvedExpressionsContainsAbstraction(
         Set<ResolvedExpression> resolvedExpressions,
         String abstractionName,
-        boolean isData
+        IndexComponentSelector component
     ) {
-        if (isData) {
-            return resolvedExpressions.contains(new ResolvedExpression(abstractionName))
-                || resolvedExpressions.contains(new ResolvedExpression(abstractionName, IndexComponentSelector.DATA));
+        if (resolvedExpressions.contains(new ResolvedExpression(abstractionName, component))) {
+            return true;
         }
-        return resolvedExpressions.contains(new ResolvedExpression(abstractionName, IndexComponentSelector.FAILURES));
+        if (component == IndexComponentSelector.DATA) {
+            return resolvedExpressions.contains(new ResolvedExpression(abstractionName));
+        }
+        return false;
     }
 
     /**
@@ -1313,6 +1365,13 @@ public class IndexNameExpressionResolver {
                             aliasIndices.addAll(failureIndices);
                         }
                     }
+                    if (shouldIncludeExemplarIndices(context.getOptions(), selector) && indexAbstraction.isDataStreamRelated()) {
+                        List<Index> exemplarIndices = indexAbstraction.getExemplarIndices(context.getProject());
+                        if (exemplarIndices.isEmpty() == false) {
+                            aliasIndices = aliasIndices == null ? new ArrayList<>(exemplarIndices.size()) : aliasIndices;
+                            aliasIndices.addAll(exemplarIndices);
+                        }
+                    }
                     aliasIndices = aliasIndices == null ? List.of() : aliasIndices;
                 } else {
                     aliasIndices = indexAbstraction.getIndices();
@@ -1360,6 +1419,14 @@ public class IndexNameExpressionResolver {
                     if (dataStream.getFailureIndices().isEmpty() == false) {
                         for (Index failureIndex : dataStream.getFailureIndices()) {
                             String concreteIndex = failureIndex.getName();
+                            routings = collectRoutings(routings, paramRouting, norouting, concreteIndex);
+                        }
+                    }
+                }
+                if (shouldIncludeExemplarIndices(context.getOptions(), resolvedExpression.selector())) {
+                    if (dataStream.getExemplarIndices().isEmpty() == false) {
+                        for (Index exemplarIndex : dataStream.getExemplarIndices()) {
+                            String concreteIndex = exemplarIndex.getName();
                             routings = collectRoutings(routings, paramRouting, norouting, concreteIndex);
                         }
                     }
@@ -1582,13 +1649,21 @@ public class IndexNameExpressionResolver {
         if (context.options.allowSelectors()) {
             // Ensure that the selectors are present and that they are compatible with the abstractions they are used with
             assert selector != null : "Earlier logic should have parsed selectors or added the default selectors already";
-            // Check if ::failures has been explicitly requested
+            // Check if ::failures or ::exemplars has been explicitly requested
             if (IndexComponentSelector.FAILURES.equals(selector) && indexAbstraction.isDataStreamRelated() == false) {
                 // If requested abstraction is not data stream related, then you cannot use ::failures
                 if (ignoreUnavailable) {
                     return false;
                 } else {
                     // Return the expression with the selector on it since the selector is the part that is incorrect
+                    throw notFoundException(combineSelector(name, selector));
+                }
+            }
+            if (IndexComponentSelector.EXEMPLARS.equals(selector) && indexAbstraction.isDataStreamRelated() == false) {
+                // If requested abstraction is not data stream related, then you cannot use ::exemplars
+                if (ignoreUnavailable) {
+                    return false;
+                } else {
                     throw notFoundException(combineSelector(name, selector));
                 }
             }
@@ -1942,6 +2017,18 @@ public class IndexNameExpressionResolver {
                         List<Index> failureIndices = indexAbstraction.getFailureIndices(context.getProject());
                         for (int i = 0, n = failureIndices.size(); i < n; i++) {
                             Index index = failureIndices.get(i);
+                            IndexMetadata indexMetadata = context.getProject().index(index);
+                            if (indexMetadata.getState() != excludeState) {
+                                resources.add(new ResolvedExpression(index.getName(), context.getOptions()));
+                            }
+                        }
+                    }
+                }
+                if (shouldIncludeExemplarIndices(context.getOptions(), selector)) {
+                    if (indexAbstraction.isDataStreamRelated()) {
+                        List<Index> exemplarIndices = indexAbstraction.getExemplarIndices(context.getProject());
+                        for (int i = 0, n = exemplarIndices.size(); i < n; i++) {
+                            Index index = exemplarIndices.get(i);
                             IndexMetadata indexMetadata = context.getProject().index(index);
                             if (indexMetadata.getState() != excludeState) {
                                 resources.add(new ResolvedExpression(index.getName(), context.getOptions()));

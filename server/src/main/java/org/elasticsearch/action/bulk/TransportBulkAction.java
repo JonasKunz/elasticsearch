@@ -25,6 +25,7 @@ import org.elasticsearch.action.admin.indices.rollover.RolloverRequest;
 import org.elasticsearch.action.admin.indices.rollover.RolloverResponse;
 import org.elasticsearch.action.datastreams.PastTimeSeriesIndexCreationAction;
 import org.elasticsearch.action.index.IndexRequest;
+import org.elasticsearch.action.index.WriteIndexComponentSelectorResolver;
 import org.elasticsearch.action.support.ActionFilters;
 import org.elasticsearch.action.support.IndexComponentSelector;
 import org.elasticsearch.action.support.RefCountingRunnable;
@@ -234,6 +235,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         Map<String, CreateIndexRequest> indicesToAutoCreate = new HashMap<>();
         Set<String> dataStreamsToBeRolledOver = new HashSet<>();
         Set<String> failureStoresToBeRolledOver = new HashSet<>();
+        Set<String> exemplarStoresToBeRolledOver = new HashSet<>();
         Map<String, List<Instant>> tsdbPastTimestampsToCover = pastTsdbIndexCreationEnabled ? new HashMap<>() : Map.of();
         long absoluteStartTimeMillis = threadPool.absoluteTimeInMillis();
         populateMissingTargets(
@@ -241,6 +243,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
             indicesToAutoCreate,
             dataStreamsToBeRolledOver,
             failureStoresToBeRolledOver,
+            exemplarStoresToBeRolledOver,
             tsdbPastTimestampsToCover,
             absoluteStartTimeMillis
         );
@@ -252,6 +255,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
             indicesToAutoCreate,
             dataStreamsToBeRolledOver,
             failureStoresToBeRolledOver,
+            exemplarStoresToBeRolledOver,
             tsdbPastTimestampsToCover,
             absoluteStartTimeMillis,
             relativeStartTimeNanos
@@ -269,6 +273,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         final boolean validateSliceRouting = SliceIndexing.SLICE_FEATURE_FLAG.isEnabled();
 
         for (DocWriteRequest<?> request : bulkRequest.requests) {
+            WriteIndexComponentSelectorResolver.resolve(request);
             final String concreteName = IndexNameExpressionResolver.resolveDateMathExpression(request.index());
             final IndexAbstraction indexAbstraction = indicesLookup.get(concreteName);
             if (validateSliceRouting) {
@@ -304,6 +309,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         Map<String, CreateIndexRequest> indicesToAutoCreate,
         Set<String> dataStreamsToBeRolledOver,
         Set<String> failureStoresToBeRolledOver,
+        Set<String> exemplarStoresToBeRolledOver,
         Map<String, List<Instant>> tsdbPastTimestampsToCover,
         long absoluteStartTimeMillis
     ) {
@@ -313,6 +319,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
             indicesToAutoCreate,
             dataStreamsToBeRolledOver,
             failureStoresToBeRolledOver,
+            exemplarStoresToBeRolledOver,
             tsdbPastTimestampsToCover,
             absoluteStartTimeMillis
         );
@@ -324,6 +331,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         Map<String, CreateIndexRequest> indicesToAutoCreate,
         Set<String> dataStreamsToBeRolledOver,
         Set<String> failureStoresToBeRolledOver,
+        Set<String> exemplarStoresToBeRolledOver,
         Map<String, List<Instant>> tsdbPastTimestampsToCover,
         long absoluteStartTimeMillis
     ) {
@@ -344,6 +352,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
                 continue;
             }
             boolean writeToFailureStore = request instanceof IndexRequest indexRequest && indexRequest.isWriteToFailureStore();
+            boolean writeToExemplarStore = request instanceof IndexRequest indexRequest && indexRequest.isWriteToExemplarStore();
             boolean indexExists = indexExistence.computeIfAbsent(request.index(), indexExistenceComputation);
             if (indexExists == false) {
                 // We should only auto-create an index if _none_ of the requests are requiring it to be an alias.
@@ -360,28 +369,36 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
                         createIndexRequest = new CreateIndexRequest(request.index()).cause("auto(bulk api)")
                             .masterNodeTimeout(bulkRequest.timeout())
                             .requireDataStream(request.isRequireDataStream())
-                            // If this IndexRequest is directed towards a failure store, but the data stream doesn't exist, we initialize
-                            // the failure store on data stream creation instead of lazily.
-                            .initializeFailureStore(writeToFailureStore);
+                            // If this IndexRequest is directed towards a component store, but the data stream doesn't exist, we initialize
+                            // the component on data stream creation instead of lazily.
+                            .initializeFailureStore(writeToFailureStore)
+                            .initializeExemplarStore(writeToExemplarStore);
                         indicesToAutoCreate.put(request.index(), createIndexRequest);
                     } else {
                         // Track whether one of the index requests in this bulk request requires the target to be a data stream.
                         if (createIndexRequest.isRequireDataStream() == false && request.isRequireDataStream()) {
                             createIndexRequest.requireDataStream(true);
                         }
-                        // Track whether one of the index requests in this bulk request is directed towards a failure store.
+                        // Track whether one of the index requests in this bulk request is directed towards a component store.
                         if (createIndexRequest.isInitializeFailureStore() == false && writeToFailureStore) {
                             createIndexRequest.initializeFailureStore(true);
+                        }
+                        if (createIndexRequest.isInitializeExemplarStore() == false && writeToExemplarStore) {
+                            createIndexRequest.initializeExemplarStore(true);
                         }
                     }
                 }
             }
-            // Determine which data streams and failure stores need to be rolled over and for an existing
+            // Determine which data streams and component stores need to be rolled over and for an existing
             // tsdb if we need to create past time series indices.
             DataStream dataStream = projectState.metadata().dataStreams().get(request.index());
             if (dataStream != null) {
-                // Only rolling over is applicable for failure store.
-                if (writeToFailureStore) {
+                if (writeToExemplarStore) {
+                    if (dataStream.isExemplarStoreExplicitlyEnabled() && dataStream.getExemplarComponent().isRolloverOnWrite()) {
+                        exemplarStoresToBeRolledOver.add(request.index());
+                    }
+                } else if (writeToFailureStore) {
+                    // Only rolling over is applicable for failure store.
                     if (dataStream.getFailureComponent().isRolloverOnWrite()) {
                         failureStoresToBeRolledOver.add(request.index());
                     }
@@ -509,6 +526,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         Map<String, CreateIndexRequest> indicesToAutoCreate,
         Set<String> dataStreamsToBeRolledOver,
         Set<String> failureStoresToBeRolledOver,
+        Set<String> exemplarStoresToBeRolledOver,
         Map<String, List<Instant>> tsdbPastTimestampsToCover,
         long absoluteStartTimeMillis,
         long relativeStartTimeNanos
@@ -518,6 +536,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         if (indicesToAutoCreate.isEmpty()
             && dataStreamsToBeRolledOver.isEmpty()
             && failureStoresToBeRolledOver.isEmpty()
+            && exemplarStoresToBeRolledOver.isEmpty()
             && tsdbPastTimestampsToCover.isEmpty()) {
             executeBulk(task, bulkRequest, relativeStartTimeNanos, listener, executor, responses);
             return;
@@ -525,6 +544,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         Map<String, Exception> indicesExceptions = new ConcurrentHashMap<>();
         Map<String, Exception> dataStreamExceptions = new ConcurrentHashMap<>();
         Map<String, Exception> failureStoreExceptions = new ConcurrentHashMap<>();
+        Map<String, Exception> exemplarStoreExceptions = new ConcurrentHashMap<>();
         Map<String, Map<Instant, Exception>> pastTsdbIndicesExceptions = new ConcurrentHashMap<>();
         Runnable executeBulkRunnable = () -> executor.execute(new ActionRunnable<>(listener) {
             @Override
@@ -533,6 +553,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
                     indicesExceptions,
                     dataStreamExceptions,
                     failureStoreExceptions,
+                    exemplarStoreExceptions,
                     pastTsdbIndicesExceptions,
                     bulkRequest,
                     responses
@@ -542,8 +563,9 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         });
         try (RefCountingRunnable refs = new RefCountingRunnable(executeBulkRunnable)) {
             createIndices(indicesToAutoCreate, refs, indicesExceptions);
-            rollOverDataStreams(bulkRequest, dataStreamsToBeRolledOver, false, refs, dataStreamExceptions);
-            rollOverDataStreams(bulkRequest, failureStoresToBeRolledOver, true, refs, failureStoreExceptions);
+            rollOverDataStreams(bulkRequest, dataStreamsToBeRolledOver, null, refs, dataStreamExceptions);
+            rollOverDataStreams(bulkRequest, failureStoresToBeRolledOver, IndexComponentSelector.FAILURES, refs, failureStoreExceptions);
+            rollOverDataStreams(bulkRequest, exemplarStoresToBeRolledOver, IndexComponentSelector.EXEMPLARS, refs, exemplarStoreExceptions);
             createPastTimeSeriesIndices(bulkRequest, tsdbPastTimestampsToCover, refs, pastTsdbIndicesExceptions, absoluteStartTimeMillis);
         }
     }
@@ -643,16 +665,16 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
     private void rollOverDataStreams(
         BulkRequest bulkRequest,
         Set<String> dataStreamsToBeRolledOver,
-        boolean targetFailureStore,
+        IndexComponentSelector rolloverComponent,
         RefCountingRunnable refs,
         Map<String, Exception> dataStreamExceptions
     ) {
         for (String dataStream : dataStreamsToBeRolledOver) {
-            RolloverRequest rolloverRequest = new RolloverRequest(dataStream, null);
+            String rolloverTarget = rolloverComponent == null
+                ? dataStream
+                : IndexNameExpressionResolver.combineSelector(dataStream, rolloverComponent);
+            RolloverRequest rolloverRequest = new RolloverRequest(rolloverTarget, null);
             rolloverRequest.masterNodeTimeout(bulkRequest.timeout);
-            if (targetFailureStore) {
-                rolloverRequest.setRolloverTarget(IndexNameExpressionResolver.combineSelector(dataStream, IndexComponentSelector.FAILURES));
-            }
             // We are executing a lazy rollover because it is an action specialised for this situation, when we want an
             // unconditional and performant rollover.
             rollOver(rolloverRequest, ActionListener.releaseAfter(new ActionListener<>() {
@@ -687,6 +709,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         Map<String, Exception> indicesExceptions,
         Map<String, Exception> dataStreamExceptions,
         Map<String, Exception> failureStoreExceptions,
+        Map<String, Exception> exemplarStoreExceptions,
         Map<String, Map<Instant, Exception>> pastTsdbIndicesExceptions,
         BulkRequest bulkRequest,
         AtomicArray<BulkItemResponse> responses
@@ -694,6 +717,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
         if (indicesExceptions.isEmpty()
             && dataStreamExceptions.isEmpty()
             && failureStoreExceptions.isEmpty()
+            && exemplarStoreExceptions.isEmpty()
             && pastTsdbIndicesExceptions.isEmpty()) {
             return;
         }
@@ -705,7 +729,9 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
             var exception = indicesExceptions.get(request.index());
             if (exception == null) {
                 if (request instanceof IndexRequest indexRequest) {
-                    if (indexRequest.isWriteToFailureStore()) {
+                    if (indexRequest.isWriteToExemplarStore()) {
+                        exception = exemplarStoreExceptions.get(request.index());
+                    } else if (indexRequest.isWriteToFailureStore()) {
                         exception = failureStoreExceptions.get(request.index());
                     } else if (pastTsdbIndicesExceptions.containsKey(request.index())) {
                         // We first check past tsdb indices because it's a more specific failure

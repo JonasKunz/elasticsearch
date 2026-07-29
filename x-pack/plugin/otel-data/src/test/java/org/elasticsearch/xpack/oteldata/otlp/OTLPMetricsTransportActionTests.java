@@ -9,10 +9,13 @@ package org.elasticsearch.xpack.oteldata.otlp;
 
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse;
+import io.opentelemetry.proto.metrics.v1.Exemplar;
 import io.opentelemetry.proto.metrics.v1.Metric;
 
 import com.google.protobuf.InvalidProtocolBufferException;
 
+import org.elasticsearch.action.bulk.BulkRequestBuilder;
+import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.support.ActionFilters;
 import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
@@ -32,8 +35,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createDoubleDataPoint;
+import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createExemplar;
+import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createGaugeMetric;
 import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.keyValue;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -105,6 +112,44 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             Settings.builder().put(OTelPlugin.HISTOGRAM_FIELD_TYPE_SETTING.getKey(), "exponential_histogram").build()
         );
         assertThat(metricsAction.defaultMappingHints, equalTo(MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM));
+    }
+
+    public void testExemplarBulkRequests() throws Exception {
+        byte[] traceId = new byte[16];
+        byte[] spanId = new byte[8];
+        Exemplar exemplar = createExemplar(1_704_067_713_467_655_123L, 42.5, traceId, spanId);
+        Metric metric = createGaugeMetric(
+            "request.duration",
+            "s",
+            List.of(createDoubleDataPoint(1_704_067_713_467_654_000L, 1_704_067_713_467_654_000L, List.of(), List.of(exemplar)))
+        );
+        BulkRequestBuilder bulkRequestBuilder = new BulkRequestBuilder(client);
+        metricsAction.prepareBulkRequest(createMetricsRequest(metric), bulkRequestBuilder);
+
+        assertThat(bulkRequestBuilder.numberOfActions(), equalTo(2));
+
+        var requests = bulkRequestBuilder.request().requests();
+        IndexRequest metricRequest = (IndexRequest) requests.getFirst();
+        IndexRequest exemplarRequest = (IndexRequest) requests.getLast();
+
+        assertThat(metricRequest.index(), equalTo("metrics-generic.otel-default"));
+        assertThat(exemplarRequest.index(), equalTo("metrics-generic.otel-default::exemplars"));
+        assertThat(exemplarRequest.isRequireDataStream(), equalTo(true));
+        assertThat(exemplarRequest.tsid(), nullValue());
+        assertThat(metricRequest.tsid(), org.hamcrest.Matchers.not(nullValue()));
+    }
+
+    public void testSummaryMetricsDoNotCreateExemplarRequests() throws Exception {
+        Metric metric = OtlpUtils.createSummaryMetric(
+            "latency",
+            "s",
+            List.of(OtlpUtils.createSummaryDataPoint(1_704_067_713_467_654_000L, List.of()))
+        );
+        BulkRequestBuilder bulkRequestBuilder = new BulkRequestBuilder(client);
+        metricsAction.prepareBulkRequest(createMetricsRequest(metric), bulkRequestBuilder);
+
+        assertThat(bulkRequestBuilder.numberOfActions(), equalTo(1));
+        assertThat(bulkRequestBuilder.request().requests().getFirst().index(), equalTo("metrics-generic.otel-default"));
     }
 
     // --- helpers ---

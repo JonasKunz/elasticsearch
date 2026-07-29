@@ -944,11 +944,11 @@ public class MetadataIndexTemplateService {
                         + "] specifies data stream options that can only be used in combination with a data stream"
                 );
             }
+            DataStreamOptions dataStreamOptions = dataStreamOptionsBuilder.build();
             if (globalRetention != null) {
                 // We cannot know for sure if the template will apply to internal data streams, so we use a simpler heuristic:
                 // If all the index patterns start with a dot, we consider that all the connected data streams are internal.
                 boolean isInternalDataStream = template.indexPatterns().stream().allMatch(indexPattern -> indexPattern.charAt(0) == '.');
-                DataStreamOptions dataStreamOptions = dataStreamOptionsBuilder.build();
                 if (dataStreamOptions.failureStore() != null && dataStreamOptions.failureStore().lifecycle() != null) {
                     dataStreamOptions.failureStore()
                         .lifecycle()
@@ -1704,7 +1704,9 @@ public class MetadataIndexTemplateService {
     }
 
     private static boolean isDataStreamIndex(String indexName) {
-        return indexName.startsWith(DataStream.BACKING_INDEX_PREFIX) || indexName.startsWith(DataStream.FAILURE_STORE_PREFIX);
+        return indexName.startsWith(DataStream.BACKING_INDEX_PREFIX)
+            || indexName.startsWith(DataStream.FAILURE_STORE_PREFIX)
+            || indexName.startsWith(DataStream.EXEMPLAR_STORE_PREFIX);
     }
 
     /**

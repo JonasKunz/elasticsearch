@@ -24,6 +24,7 @@ import org.elasticsearch.action.datastreams.autosharding.DataStreamAutoShardingS
 import org.elasticsearch.action.support.ActionFilters;
 import org.elasticsearch.action.support.ActiveShardCount;
 import org.elasticsearch.action.support.ActiveShardsObserver;
+import org.elasticsearch.action.support.IndexComponentSelector;
 import org.elasticsearch.action.support.IndicesOptions;
 import org.elasticsearch.action.support.master.TransportMasterNodeAction;
 import org.elasticsearch.client.internal.Client;
@@ -171,12 +172,16 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
             DataStream dataStream = (DataStream) indexAbstraction;
             boolean targetFailureStore = resolvedRolloverTarget.selector() != null
                 && resolvedRolloverTarget.selector().shouldIncludeFailures();
-            if (targetFailureStore == false) {
+            boolean targetExemplarStore = resolvedRolloverTarget.selector() != null
+                && resolvedRolloverTarget.selector().shouldIncludeExemplars();
+            if (targetFailureStore == false && targetExemplarStore == false) {
                 assert dataStream.getWriteIndex() != null : dataStream.getName() + " is a data stream but has no write index";
                 assert dataStream.getWriteIndex().getName() != null
                     : dataStream.getName() + " is a data stream but the write index is null";
                 indicesToCheck = new String[] { dataStream.getWriteIndex().getName() };
-            } else if (dataStream.getWriteFailureIndex() != null) {
+            } else if (targetExemplarStore && dataStream.getWriteExemplarIndex() != null) {
+                indicesToCheck = new String[] { dataStream.getWriteExemplarIndex().getName() };
+            } else if (targetFailureStore && dataStream.getWriteFailureIndex() != null) {
                 assert dataStream.getWriteFailureIndex().getName() != null
                     : "the write index for the data stream " + dataStream.getName() + " is null";
                 indicesToCheck = new String[] { dataStream.getWriteFailureIndex().getName() };
@@ -210,7 +215,9 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
             rolloverRequest.getRolloverTarget(),
             rolloverRequest.indicesOptions()
         );
-        boolean targetFailureStore = resolvedRolloverTarget.selector() != null && resolvedRolloverTarget.selector().shouldIncludeFailures();
+        IndexComponentSelector rolloverComponent = resolveRolloverComponent(resolvedRolloverTarget);
+        boolean targetFailureStore = rolloverComponent == IndexComponentSelector.FAILURES;
+        boolean targetExemplarStore = rolloverComponent == IndexComponentSelector.EXEMPLARS;
 
         // We evaluate the names of the index for which we should evaluate conditions, as well as what our newly created index *would* be.
         final MetadataRolloverService.NameResolution trialRolloverNames = MetadataRolloverService.resolveRolloverNames(
@@ -218,7 +225,7 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
             resolvedRolloverTarget.resource(),
             rolloverRequest.getNewIndexName(),
             rolloverRequest.getCreateIndexRequest(),
-            targetFailureStore
+            rolloverComponent
         );
         final String trialSourceIndexName = trialRolloverNames.sourceName();
         final String trialRolloverIndexName = trialRolloverNames.rolloverName();
@@ -230,7 +237,7 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
                 listener,
                 projectMetadata,
                 resolvedRolloverTarget,
-                targetFailureStore,
+                rolloverComponent,
                 trialSourceIndexName,
                 trialRolloverIndexName
             );
@@ -244,14 +251,26 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
             );
             return;
         }
-        if (targetFailureStore && rolloverTargetAbstraction.isDataStreamRelated() == false) {
-            listener.onFailure(new IllegalStateException("Rolling over failure stores is only possible on data streams."));
+        if ((targetFailureStore || targetExemplarStore) && rolloverTargetAbstraction.isDataStreamRelated() == false) {
+            listener.onFailure(new IllegalStateException("Rolling over component stores is only possible on data streams."));
             return;
         }
 
-        // When we're initializing a failure store, we skip the stats request because there is no source index to retrieve stats for.
+        // When we're initializing an empty component store, we skip the stats request because there is no source index to retrieve stats
+        // for.
         if (targetFailureStore && ((DataStream) rolloverTargetAbstraction).getFailureIndices().isEmpty()) {
             initializeFailureStore(projectState.projectId(), rolloverRequest, listener, trialSourceIndexName, trialRolloverIndexName);
+            return;
+        }
+        if (targetExemplarStore && ((DataStream) rolloverTargetAbstraction).getExemplarIndices().isEmpty()) {
+            initializeEmptyComponentStore(
+                "initialize_exemplar_store",
+                projectState.projectId(),
+                rolloverRequest,
+                listener,
+                trialSourceIndexName,
+                trialRolloverIndexName
+            );
             return;
         }
 
@@ -349,12 +368,16 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
         );
     }
 
+    private static IndexComponentSelector resolveRolloverComponent(ResolvedExpression resolvedRolloverTarget) {
+        return resolvedRolloverTarget.selector() == null ? IndexComponentSelector.DATA : resolvedRolloverTarget.selector();
+    }
+
     private void markForLazyRollover(
         RolloverRequest rolloverRequest,
         ActionListener<RolloverResponse> listener,
         ProjectMetadata projectMetadata,
         ResolvedExpression resolvedRolloverTarget,
-        boolean targetFailureStore,
+        IndexComponentSelector rolloverComponent,
         String trialSourceIndexName,
         String trialRolloverIndexName
     ) {
@@ -383,7 +406,7 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
             projectMetadata.id(),
             resolvedRolloverTarget.resource(),
             true,
-            targetFailureStore,
+            rolloverComponent,
             rolloverRequest.ackTimeout(),
             rolloverRequest.masterNodeTimeout(),
             listener.map(
@@ -408,9 +431,27 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
         String trialSourceIndexName,
         String trialRolloverIndexName
     ) {
+        initializeEmptyComponentStore(
+            "initialize_failure_store",
+            projectId,
+            rolloverRequest,
+            listener,
+            trialSourceIndexName,
+            trialRolloverIndexName
+        );
+    }
+
+    private void initializeEmptyComponentStore(
+        String sourcePrefix,
+        ProjectId projectId,
+        RolloverRequest rolloverRequest,
+        ActionListener<RolloverResponse> listener,
+        String trialSourceIndexName,
+        String trialRolloverIndexName
+    ) {
         if (rolloverRequest.getConditionValues().isEmpty() == false) {
             listener.onFailure(
-                new IllegalStateException("Rolling over/initializing an empty failure store is only supported without conditions.")
+                new IllegalStateException("Rolling over/initializing an empty data stream component is only supported without conditions.")
             );
             return;
         }
@@ -431,7 +472,7 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
             return;
         }
 
-        String source = "initialize_failure_store with index [" + trialRolloverIndexName + "]";
+        String source = sourcePrefix + " with index [" + trialRolloverIndexName + "]";
         RolloverTask rolloverTask = new RolloverTask(projectId, rolloverRequest, null, trialRolloverResponse, null, listener);
         rolloverTaskQueue.submitTask(source, rolloverTask, rolloverRequest.masterNodeTimeout());
     }
@@ -547,8 +588,7 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
                 rolloverRequest.getRolloverTarget(),
                 rolloverRequest.indicesOptions()
             );
-            boolean targetFailureStore = resolvedRolloverTarget.selector() != null
-                && resolvedRolloverTarget.selector().shouldIncludeFailures();
+            IndexComponentSelector rolloverComponent = resolveRolloverComponent(resolvedRolloverTarget);
 
             // Regenerate the rollover names, as a rollover could have happened in between the pre-check and the cluster state update
             final var project = currentState.metadata().getProject(rolloverTask.projectId());
@@ -557,7 +597,7 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
                 resolvedRolloverTarget.resource(),
                 rolloverRequest.getNewIndexName(),
                 rolloverRequest.getCreateIndexRequest(),
-                targetFailureStore
+                rolloverComponent
             );
 
             // Re-evaluate the conditions, now with our final source index name
@@ -606,7 +646,7 @@ public class TransportRolloverAction extends TransportMasterNodeAction<RolloverR
                     false,
                     sourceIndexStats,
                     rolloverTask.autoShardingResult(),
-                    targetFailureStore
+                    rolloverComponent
                 );
                 resultsCollector.accept(rolloverResult.sourceIndexName() + "->" + rolloverResult.rolloverIndexName());
                 logger.trace("rollover result [{}]", rolloverResult);

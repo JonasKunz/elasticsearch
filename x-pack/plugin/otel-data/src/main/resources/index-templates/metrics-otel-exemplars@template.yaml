@@ -1,0 +1,17 @@
+---
+version: ${xpack.oteldata.template.version}
+index_patterns: [".exemplars-metrics-*"]
+priority: 120
+data_stream: {}
+_meta:
+  description: OpenTelemetry metric exemplar index template installed by x-pack
+  managed: true
+composed_of:
+  - otel@mappings
+  - otel@settings
+  - metrics-otel-exemplars@mappings
+  - semconv-resource-to-ecs@mappings
+template:
+  settings:
+    index:
+      mode: logsdb_columnar

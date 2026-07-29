@@ -370,7 +370,7 @@ public class IndexAbstractionResolver {
 
                 // Check if a selector was present, and if it is, check if this alias is applicable to it
                 IndexComponentSelector selector = IndexComponentSelector.getByKey(selectorString);
-                if (IndexComponentSelector.FAILURES.equals(selector)) {
+                if (IndexComponentSelector.FAILURES.equals(selector) || IndexComponentSelector.EXEMPLARS.equals(selector)) {
                     isVisible = indexAbstraction.isDataStreamRelated();
                 }
             }
@@ -408,7 +408,7 @@ public class IndexAbstractionResolver {
         if (selectorString != null && Regex.isMatchAllPattern(selectorString) == false) {
             // Check if a selector was present, and if it is, check if this index is applicable to it
             IndexComponentSelector selector = IndexComponentSelector.getByKey(selectorString);
-            if (IndexComponentSelector.FAILURES.equals(selector)) {
+            if (IndexComponentSelector.FAILURES.equals(selector) || IndexComponentSelector.EXEMPLARS.equals(selector)) {
                 return false;
             }
         }

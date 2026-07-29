@@ -60,6 +60,7 @@ import static org.elasticsearch.action.support.IndexComponentSelector.DATA;
 import static org.elasticsearch.action.support.IndexComponentSelector.FAILURES;
 import static org.elasticsearch.cluster.metadata.DataStreamTestHelper.backingIndexEqualTo;
 import static org.elasticsearch.cluster.metadata.DataStreamTestHelper.createBackingIndex;
+import static org.elasticsearch.cluster.metadata.DataStreamTestHelper.createExemplarStore;
 import static org.elasticsearch.cluster.metadata.DataStreamTestHelper.createFailureStore;
 import static org.elasticsearch.cluster.metadata.DataStreamTestHelper.newInstance;
 import static org.elasticsearch.cluster.metadata.DateMathExpressionResolverTests.dateFromMillis;
@@ -1782,7 +1783,7 @@ public class IndexNameExpressionResolverTests extends ESTestCase {
                 project,
                 index,
                 x -> true,
-                (alias, isData) -> alias.filteringRequired() && isData,
+                (alias, component) -> alias.filteringRequired() && DATA.equals(component),
                 true,
                 resolvedExpressions
             );
@@ -2956,6 +2957,69 @@ public class IndexNameExpressionResolverTests extends ESTestCase {
                 )
             );
         }
+    }
+
+    public void testDataStreamsWithExemplarStore() {
+        final String dataStreamName = "my-exemplar-ds";
+        IndexMetadata index1 = createBackingIndex(dataStreamName, 1, epochMillis).build();
+        IndexMetadata index2 = createBackingIndex(dataStreamName, 2, epochMillis).build();
+        IndexMetadata exemplarIndex1 = createExemplarStore(dataStreamName, 1, epochMillis).build();
+        IndexMetadata exemplarIndex2 = createExemplarStore(dataStreamName, 2, epochMillis).build();
+
+        ProjectMetadata project = ProjectMetadata.builder(Metadata.DEFAULT_PROJECT_ID)
+            .put(index1, false)
+            .put(index2, false)
+            .put(exemplarIndex1, false)
+            .put(exemplarIndex2, false)
+            .put(
+                newInstance(
+                    dataStreamName,
+                    List.of(index1.getIndex(), index2.getIndex()),
+                    List.of(),
+                    List.of(exemplarIndex1.getIndex(), exemplarIndex2.getIndex())
+                )
+            )
+            .build();
+
+        IndicesOptions indicesOptions = IndicesOptions.STRICT_EXPAND_OPEN;
+
+        Index[] onlyExemplars = indexNameExpressionResolver.concreteIndices(project, indicesOptions, true, dataStreamName + "::exemplars");
+        assertThat(onlyExemplars.length, equalTo(2));
+        assertThat(
+            Arrays.stream(onlyExemplars).map(Index::getName).toList(),
+            containsInAnyOrder(
+                DataStream.getDefaultExemplarStoreName(dataStreamName, 1, epochMillis),
+                DataStream.getDefaultExemplarStoreName(dataStreamName, 2, epochMillis)
+            )
+        );
+
+        Index[] dataAndExemplars = indexNameExpressionResolver.concreteIndices(
+            project,
+            indicesOptions,
+            true,
+            dataStreamName + "::data",
+            dataStreamName + "::exemplars"
+        );
+        assertThat(dataAndExemplars.length, equalTo(4));
+        assertThat(
+            Arrays.stream(dataAndExemplars).map(Index::getName).toList(),
+            containsInAnyOrder(
+                DataStream.getDefaultBackingIndexName(dataStreamName, 1, epochMillis),
+                DataStream.getDefaultBackingIndexName(dataStreamName, 2, epochMillis),
+                DataStream.getDefaultExemplarStoreName(dataStreamName, 1, epochMillis),
+                DataStream.getDefaultExemplarStoreName(dataStreamName, 2, epochMillis)
+            )
+        );
+
+        Index[] defaultDataOnly = indexNameExpressionResolver.concreteIndices(project, indicesOptions, true, dataStreamName);
+        assertThat(defaultDataOnly.length, equalTo(2));
+        assertThat(
+            Arrays.stream(defaultDataOnly).map(Index::getName).toList(),
+            containsInAnyOrder(
+                DataStream.getDefaultBackingIndexName(dataStreamName, 1, epochMillis),
+                DataStream.getDefaultBackingIndexName(dataStreamName, 2, epochMillis)
+            )
+        );
     }
 
     public void testDataStreamAliases() {

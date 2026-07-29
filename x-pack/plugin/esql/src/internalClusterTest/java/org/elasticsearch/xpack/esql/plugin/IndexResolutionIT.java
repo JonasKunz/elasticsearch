@@ -117,6 +117,11 @@ public class IndexResolutionIT extends AbstractEsqlIntegTestCase {
             assertOk(response);
         }
         expectThrows(
+            VerificationException.class,
+            containsString("Unknown index [data-stream-1::exemplars]"),
+            () -> run(syncEsqlQueryRequest("FROM data-stream-1::exemplars"))
+        );
+        expectThrows(
             org.elasticsearch.xpack.esql.parser.ParsingException.class,
             containsString("Invalid index name [data-stream-1::fake]"),
             () -> run(syncEsqlQueryRequest("FROM data-stream-1::fake"))

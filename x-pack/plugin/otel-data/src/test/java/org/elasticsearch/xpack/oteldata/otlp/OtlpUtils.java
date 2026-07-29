@@ -13,6 +13,7 @@ import io.opentelemetry.proto.common.v1.InstrumentationScope;
 import io.opentelemetry.proto.common.v1.KeyValue;
 import io.opentelemetry.proto.common.v1.KeyValueList;
 import io.opentelemetry.proto.metrics.v1.AggregationTemporality;
+import io.opentelemetry.proto.metrics.v1.Exemplar;
 import io.opentelemetry.proto.metrics.v1.ExponentialHistogram;
 import io.opentelemetry.proto.metrics.v1.ExponentialHistogramDataPoint;
 import io.opentelemetry.proto.metrics.v1.Gauge;
@@ -26,6 +27,8 @@ import io.opentelemetry.proto.metrics.v1.Sum;
 import io.opentelemetry.proto.metrics.v1.Summary;
 import io.opentelemetry.proto.metrics.v1.SummaryDataPoint;
 import io.opentelemetry.proto.resource.v1.Resource;
+
+import com.google.protobuf.ByteString;
 
 import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MappingHints;
 
@@ -158,10 +161,20 @@ public class OtlpUtils {
     }
 
     public static NumberDataPoint createDoubleDataPoint(long timeUnixNano, long startTimeUnixNano, List<KeyValue> attributes) {
+        return createDoubleDataPoint(timeUnixNano, startTimeUnixNano, attributes, List.of());
+    }
+
+    public static NumberDataPoint createDoubleDataPoint(
+        long timeUnixNano,
+        long startTimeUnixNano,
+        List<KeyValue> attributes,
+        List<Exemplar> exemplars
+    ) {
         return NumberDataPoint.newBuilder()
             .setTimeUnixNano(timeUnixNano)
             .setStartTimeUnixNano(startTimeUnixNano)
             .addAllAttributes(attributes)
+            .addAllExemplars(exemplars)
             .setAsDouble(randomDouble())
             .build();
     }
@@ -213,5 +226,26 @@ public class OtlpUtils {
         }
 
         return ExportMetricsServiceRequest.newBuilder().addAllResourceMetrics(resourceMetrics).build();
+    }
+
+    public static Exemplar createExemplar(long timeUnixNano, double value, byte[] traceId, byte[] spanId, KeyValue... filteredAttributes) {
+        Exemplar.Builder builder = Exemplar.newBuilder()
+            .setTimeUnixNano(timeUnixNano)
+            .setAsDouble(value)
+            .setTraceId(ByteString.copyFrom(traceId))
+            .setSpanId(ByteString.copyFrom(spanId));
+        for (KeyValue filteredAttribute : filteredAttributes) {
+            builder.addFilteredAttributes(filteredAttribute);
+        }
+        return builder.build();
+    }
+
+    public static Exemplar createIntExemplar(long timeUnixNano, long value, byte[] traceId, byte[] spanId) {
+        return Exemplar.newBuilder()
+            .setTimeUnixNano(timeUnixNano)
+            .setAsInt(value)
+            .setTraceId(ByteString.copyFrom(traceId))
+            .setSpanId(ByteString.copyFrom(spanId))
+            .build();
     }
 }

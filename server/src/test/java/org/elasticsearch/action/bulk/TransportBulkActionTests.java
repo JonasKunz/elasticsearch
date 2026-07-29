@@ -29,6 +29,7 @@ import org.elasticsearch.client.internal.node.NodeClient;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.ComposableIndexTemplate;
 import org.elasticsearch.cluster.metadata.DataStream;
+import org.elasticsearch.cluster.metadata.DataStreamExemplarStore;
 import org.elasticsearch.cluster.metadata.DataStreamFailureStoreSettings;
 import org.elasticsearch.cluster.metadata.DataStreamGlobalRetentionSettings;
 import org.elasticsearch.cluster.metadata.DataStreamOptions;
@@ -120,8 +121,10 @@ public class TransportBulkActionTests extends ESTestCase {
         volatile Exception failIndexCreationException;
         volatile Exception failDataStreamRolloverException;
         volatile Exception failFailureStoreRolloverException;
+        volatile Exception failExemplarStoreRolloverException;
         boolean indexCreated = false; // set when the "real" index is created
         Runnable beforeIndexCreation = null;
+        CreateIndexRequest capturedCreateIndexRequest;
 
         TestTransportBulkAction() {
             super(
@@ -170,6 +173,7 @@ public class TransportBulkActionTests extends ESTestCase {
         @Override
         void createIndex(CreateIndexRequest createIndexRequest, ActionListener<CreateIndexResponse> listener) {
             indexCreated = true;
+            capturedCreateIndexRequest = createIndexRequest;
             if (beforeIndexCreation != null) {
                 beforeIndexCreation.run();
             }
@@ -183,11 +187,13 @@ public class TransportBulkActionTests extends ESTestCase {
         @Override
         void rollOver(RolloverRequest rolloverRequest, ActionListener<RolloverResponse> listener) {
             String selectorString = IndexNameExpressionResolver.splitSelectorExpression(rolloverRequest.getRolloverTarget()).v2();
-            boolean isFailureStoreRollover = IndexComponentSelector.FAILURES.getKey().equals(selectorString);
-            if (failDataStreamRolloverException != null && isFailureStoreRollover == false) {
+            IndexComponentSelector selector = IndexComponentSelector.getByKey(selectorString);
+            if (failDataStreamRolloverException != null && selector == null) {
                 listener.onFailure(failDataStreamRolloverException);
-            } else if (failFailureStoreRolloverException != null && isFailureStoreRollover) {
+            } else if (failFailureStoreRolloverException != null && selector == IndexComponentSelector.FAILURES) {
                 listener.onFailure(failFailureStoreRolloverException);
+            } else if (failExemplarStoreRolloverException != null && selector == IndexComponentSelector.EXEMPLARS) {
+                listener.onFailure(failExemplarStoreRolloverException);
             } else {
                 listener.onResponse(
                     new RolloverResponse(null, null, Map.of(), rolloverRequest.isDryRun(), true, true, true, rolloverRequest.isLazy())
@@ -923,6 +929,65 @@ public class TransportBulkActionTests extends ESTestCase {
         assertTrue(failureStoreFailure.isFailed());
         assertEquals("failure-store-rollover-exception", failureStoreFailure.getFailure().getCause().getMessage());
         assertNull(bulkRequest.requests.get(2));
+    }
+
+    public void testAutoCreateDataStreamInitializesExemplarStoreFromSelector() throws Exception {
+        BulkRequest bulkRequest = new BulkRequest().add(
+            new IndexRequest("metrics-otel-default::exemplars").source(Map.of("value", 1.0)).opType(DocWriteRequest.OpType.CREATE)
+        );
+
+        PlainActionFuture<BulkResponse> future = new PlainActionFuture<>();
+        ActionTestUtils.execute(bulkAction, null, bulkRequest, future);
+        future.actionGet();
+
+        assertTrue(bulkAction.indexCreated);
+        assertThat(bulkAction.capturedCreateIndexRequest.index(), equalTo("metrics-otel-default"));
+        assertThat(bulkAction.capturedCreateIndexRequest.isInitializeExemplarStore(), is(true));
+        assertThat(bulkAction.capturedCreateIndexRequest.isInitializeFailureStore(), is(false));
+    }
+
+    public void testExemplarStoreRolloverFailureFailsBulkItem() throws InterruptedException {
+        String exemplarDataStream = "exemplar-store";
+        BulkRequest bulkRequest = new BulkRequest().add(
+            new IndexRequest(exemplarDataStream).source(Map.of()).setWriteToExemplarStore(true).opType(DocWriteRequest.OpType.CREATE)
+        );
+
+        final ClusterState oldState = clusterService.state();
+        final ProjectId projectId = randomUniqueProjectId();
+        final Metadata metadata = Metadata.builder(oldState.metadata())
+            .removeProject(Metadata.DEFAULT_PROJECT_ID)
+            .put(
+                ProjectMetadata.builder(projectId)
+                    .put(indexMetadata(".ds-exemplar-store-01"))
+                    .put(
+                        DataStream.builder(exemplarDataStream, List.of(new Index(".ds-exemplar-store-01", randomUUID())))
+                            .setDataStreamOptions(new DataStreamOptions(null, new DataStreamExemplarStore(true, "metrics-otel-exemplars")))
+                            .setExemplarIndices(
+                                DataStream.DataStreamIndices.exemplarIndicesBuilder(List.of()).setRolloverOnWrite(true).build()
+                            )
+                            .build()
+                    )
+            )
+            .build();
+        final ClusterState clusterState = ClusterState.builder(oldState)
+            .metadata(metadata)
+            .routingTable(GlobalRoutingTableTestHelper.buildRoutingTable(metadata, RoutingTable.Builder::addAsNew))
+            .build();
+
+        CountDownLatch latch = new CountDownLatch(1);
+        clusterService.getClusterApplierService()
+            .onNewClusterState("set-state", () -> clusterState, ActionListener.running(latch::countDown));
+        latch.await(10L, TimeUnit.SECONDS);
+
+        activeProjectId.set(projectId);
+        bulkAction.failExemplarStoreRolloverException = new RuntimeException("exemplar-store-rollover-exception");
+
+        PlainActionFuture<BulkResponse> future = new PlainActionFuture<>();
+        ActionTestUtils.execute(bulkAction, null, bulkRequest, future);
+        BulkResponse response = future.actionGet();
+        assertEquals(1, response.getItems().length);
+        assertTrue(response.getItems()[0].isFailed());
+        assertEquals("exemplar-store-rollover-exception", response.getItems()[0].getFailure().getCause().getMessage());
     }
 
     private BulkRequest buildBulkRequest(List<String> indices) {

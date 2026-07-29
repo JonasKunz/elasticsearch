@@ -43,6 +43,8 @@ public class CreateIndexClusterStateUpdateRequest {
     private SystemDataStreamDescriptor systemDataStreamDescriptor;
     private boolean isFailureIndex = false;
 
+    private boolean isExemplarIndex = false;
+
     private Settings settings = Settings.EMPTY;
 
     private String mappings = "{}";
@@ -128,6 +130,11 @@ public class CreateIndexClusterStateUpdateRequest {
         return this;
     }
 
+    public CreateIndexClusterStateUpdateRequest isExemplarIndex(boolean isExemplarIndex) {
+        this.isExemplarIndex = isExemplarIndex;
+        return this;
+    }
+
     public String cause() {
         return cause;
     }
@@ -206,6 +213,10 @@ public class CreateIndexClusterStateUpdateRequest {
         return isFailureIndex;
     }
 
+    public boolean isExemplarIndex() {
+        return isExemplarIndex;
+    }
+
     public CreateIndexClusterStateUpdateRequest dataStreamName(String dataStreamName) {
         this.dataStreamName = dataStreamName;
         return this;
@@ -280,6 +291,8 @@ public class CreateIndexClusterStateUpdateRequest {
             + matchingTemplate
             + ", isFailureIndex="
             + isFailureIndex
+            + ", isExemplarIndex="
+            + isExemplarIndex
             + '}';
     }
 }

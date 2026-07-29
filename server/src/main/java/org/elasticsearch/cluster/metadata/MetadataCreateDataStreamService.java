@@ -79,18 +79,25 @@ public class MetadataCreateDataStreamService {
     public void createDataStream(CreateDataStreamClusterStateUpdateRequest request, ActionListener<AcknowledgedResponse> finalListener) {
         AtomicReference<String> firstBackingIndexRef = new AtomicReference<>();
         AtomicReference<String> firstFailureStoreRef = new AtomicReference<>();
+        AtomicReference<String> firstExemplarStoreRef = new AtomicReference<>();
         ActionListener<AcknowledgedResponse> listener = finalListener.delegateFailureAndWrap((l, response) -> {
             if (response.isAcknowledged()) {
                 String firstBackingIndexName = firstBackingIndexRef.get();
                 assert firstBackingIndexName != null;
                 String firstFailureStoreName = firstFailureStoreRef.get();
-                var waitForIndices = firstFailureStoreName == null
-                    ? new String[] { firstBackingIndexName }
-                    : new String[] { firstBackingIndexName, firstFailureStoreName };
+                String firstExemplarStoreName = firstExemplarStoreRef.get();
+                var waitForIndices = new ArrayList<String>();
+                waitForIndices.add(firstBackingIndexName);
+                if (firstFailureStoreName != null) {
+                    waitForIndices.add(firstFailureStoreName);
+                }
+                if (firstExemplarStoreName != null) {
+                    waitForIndices.add(firstExemplarStoreName);
+                }
                 ActiveShardsObserver.waitForActiveShards(
                     clusterService,
                     request.projectId(),
-                    waitForIndices,
+                    waitForIndices.toArray(String[]::new),
                     ActiveShardCount.DEFAULT,
                     request.masterNodeTimeout(),
                     l.map(shardsAcked -> AcknowledgedResponse.TRUE)
@@ -117,12 +124,16 @@ public class MetadataCreateDataStreamService {
                         currentState,
                         RerouteBehavior.PERFORM_REROUTE,
                         delegate.reroute(),
+                        false,
                         false
                     );
                     DataStream createdDataStream = clusterState.metadata().getProject(request.projectId()).dataStreams().get(request.name);
                     firstBackingIndexRef.set(createdDataStream.getIndices().get(0).getName());
                     if (createdDataStream.getFailureIndices().isEmpty() == false) {
                         firstFailureStoreRef.set(createdDataStream.getFailureIndices().get(0).getName());
+                    }
+                    if (createdDataStream.getExemplarIndices().isEmpty() == false) {
+                        firstExemplarStoreRef.set(createdDataStream.getExemplarIndices().get(0).getName());
                     }
                     return clusterState;
                 }
@@ -140,7 +151,8 @@ public class MetadataCreateDataStreamService {
         ClusterState current,
         RerouteBehavior rerouteBehavior,
         ActionListener<Void> rerouteListener,
-        boolean initializeFailureStore
+        boolean initializeFailureStore,
+        boolean initializeExemplarStore
     ) throws Exception {
         return createDataStream(
             metadataCreateIndexService,
@@ -150,7 +162,8 @@ public class MetadataCreateDataStreamService {
             request,
             rerouteBehavior,
             rerouteListener,
-            initializeFailureStore
+            initializeFailureStore,
+            initializeExemplarStore
         );
     }
 
@@ -195,7 +208,8 @@ public class MetadataCreateDataStreamService {
         CreateDataStreamClusterStateUpdateRequest request,
         RerouteBehavior rerouteBehavior,
         ActionListener<Void> rerouteListener,
-        boolean initializeFailureStore
+        boolean initializeFailureStore,
+        boolean initializeExemplarStore
     ) throws Exception {
         return createDataStream(
             metadataCreateIndexService,
@@ -207,7 +221,8 @@ public class MetadataCreateDataStreamService {
             null,
             rerouteBehavior,
             rerouteListener,
-            initializeFailureStore
+            initializeFailureStore,
+            initializeExemplarStore
         );
     }
 
@@ -221,6 +236,8 @@ public class MetadataCreateDataStreamService {
      * @param writeIndex Write index for the data stream. If null, a new write index will be created.
      * @param initializeFailureStore Whether the failure store should be initialized (N.B. if true, failure store index creation will be
      *     performed regardless of whether the template indicates that the failure store is enabled)
+     * @param initializeExemplarStore Whether the exemplar store should be initialized (N.B. if true, exemplar store index creation will be
+     *     performed regardless of whether the template indicates that the exemplar store is enabled)
      * @return Cluster state containing the new data stream
      */
     static ClusterState createDataStream(
@@ -233,7 +250,8 @@ public class MetadataCreateDataStreamService {
         IndexMetadata writeIndex,
         RerouteBehavior rerouteBehavior,
         ActionListener<Void> rerouteListener,
-        boolean initializeFailureStore
+        boolean initializeFailureStore,
+        boolean initializeExemplarStore
     ) throws Exception {
         String dataStreamName = request.name;
         SystemDataStreamDescriptor systemDataStreamDescriptor = request.systemDataStreamDescriptor();
@@ -276,6 +294,11 @@ public class MetadataCreateDataStreamService {
                 "data_stream [" + dataStreamName + "] must not start with '" + DataStream.FAILURE_STORE_PREFIX + "'"
             );
         }
+        if (dataStreamName.startsWith(DataStream.EXEMPLAR_STORE_PREFIX)) {
+            throw new IllegalArgumentException(
+                "data_stream [" + dataStreamName + "] must not start with '" + DataStream.EXEMPLAR_STORE_PREFIX + "'"
+            );
+        }
 
         final boolean isSystem = systemDataStreamDescriptor != null;
         final ComposableIndexTemplate template = isSystem
@@ -315,6 +338,34 @@ public class MetadataCreateDataStreamService {
             failureStoreIndex = currentState.metadata().getProject(request.projectId()).index(failureStoreIndexName);
         }
 
+        IndexMetadata exemplarStoreIndex = null;
+        if (initializeExemplarStore) {
+            if (dataStreamOptions == null
+                || dataStreamOptions.exemplarStore() == null
+                || Boolean.TRUE.equals(dataStreamOptions.exemplarStore().enabled()) == false) {
+                throw new IllegalArgumentException(
+                    "cannot initialize exemplar store for data stream ["
+                        + dataStreamName
+                        + "] because exemplar store is not enabled in the matching index template"
+                );
+            }
+            String exemplarStoreIndexName = DataStream.getDefaultExemplarStoreName(dataStreamName, initialGeneration, request.startTime());
+            currentState = createExemplarStoreIndex(
+                metadataCreateIndexService,
+                "initialize_data_stream",
+                request.projectId(),
+                settings,
+                currentState,
+                request.startTime(),
+                dataStreamName,
+                dataStreamOptions,
+                systemDataStreamDescriptor,
+                exemplarStoreIndexName,
+                null
+            );
+            exemplarStoreIndex = currentState.metadata().getProject(request.projectId()).index(exemplarStoreIndexName);
+        }
+
         if (writeIndex == null) {
             String firstBackingIndexName = DataStream.getDefaultBackingIndexName(dataStreamName, initialGeneration, request.startTime());
             currentState = createBackingIndex(
@@ -337,6 +388,9 @@ public class MetadataCreateDataStreamService {
         assert initializeFailureStore == false || failureStoreIndex != null : "failure store should have an initial index";
         assert failureStoreIndex == null || failureStoreIndex.mapping() != null
             : "no mapping found for failure store [" + failureStoreIndex.getIndex().getName() + "]";
+        assert initializeExemplarStore == false || exemplarStoreIndex != null : "exemplar store should have an initial index";
+        assert exemplarStoreIndex == null || exemplarStoreIndex.mapping() != null
+            : "no mapping found for exemplar store [" + exemplarStoreIndex.getIndex().getName() + "]";
         final var newProject = currentState.metadata().getProject(request.projectId());
 
         List<Index> dsBackingIndices = backingIndices.stream()
@@ -347,6 +401,7 @@ public class MetadataCreateDataStreamService {
         final IndexMode indexMode = newProject.retrieveIndexModeFromTemplate(template);
         final DataStreamLifecycle lifecycle = resolveDataStreamLifecycle(currentProject, systemDataStreamDescriptor, template, isSystem);
         List<Index> failureIndices = failureStoreIndex == null ? List.of() : List.of(failureStoreIndex.getIndex());
+        List<Index> exemplarIndices = exemplarStoreIndex == null ? List.of() : List.of(exemplarStoreIndex.getIndex());
         DataStream newDataStream = new DataStream(
             dataStreamName,
             initialGeneration,
@@ -364,7 +419,8 @@ public class MetadataCreateDataStreamService {
             new DataStream.DataStreamIndices(DataStream.BACKING_INDEX_PREFIX, dsBackingIndices, false, null),
             // If the failure store shouldn't be initialized on data stream creation, we're marking it for "lazy rollover", which will
             // initialize the failure store on first write.
-            new DataStream.DataStreamIndices(DataStream.FAILURE_STORE_PREFIX, failureIndices, initializeFailureStore == false, null)
+            new DataStream.DataStreamIndices(DataStream.FAILURE_STORE_PREFIX, failureIndices, initializeFailureStore == false, null),
+            new DataStream.DataStreamIndices(DataStream.EXEMPLAR_STORE_PREFIX, exemplarIndices, initializeExemplarStore == false, null)
         );
         ProjectMetadata.Builder builder = ProjectMetadata.builder(newProject).put(newDataStream);
         List<String> aliases = new ArrayList<>();
@@ -526,6 +582,88 @@ public class MetadataCreateDataStreamService {
                 RestStatus.BAD_REQUEST,
                 e,
                 failureStoreIndexName
+            );
+        }
+        return currentState;
+    }
+
+    public static ComposableIndexTemplate lookupExemplarTemplateForDataStream(
+        ProjectMetadata projectMetadata,
+        DataStreamOptions dataStreamOptions,
+        String dataStreamName
+    ) {
+        if (dataStreamOptions == null || dataStreamOptions.exemplarStore() == null) {
+            throw new IllegalArgumentException("data stream [" + dataStreamName + "] does not have an exemplar store configured");
+        }
+        String templateName = dataStreamOptions.exemplarStore().indexTemplate();
+        if (org.elasticsearch.common.Strings.hasText(templateName) == false) {
+            throw new IllegalArgumentException(
+                "data stream ["
+                    + dataStreamName
+                    + "] exemplar store is enabled but [index_template] is not configured in data stream options"
+            );
+        }
+        ComposableIndexTemplate exemplarTemplate = projectMetadata.templatesV2().get(templateName);
+        if (exemplarTemplate == null) {
+            throw new IllegalArgumentException(
+                "exemplar store index template [" + templateName + "] for data stream [" + dataStreamName + "] does not exist"
+            );
+        }
+        if (exemplarTemplate.getDataStreamTemplate() == null) {
+            throw new IllegalArgumentException(
+                "exemplar store index template ["
+                    + templateName
+                    + "] for data stream ["
+                    + dataStreamName
+                    + "] must be a data stream template"
+            );
+        }
+        return exemplarTemplate;
+    }
+
+    public static ClusterState createExemplarStoreIndex(
+        MetadataCreateIndexService metadataCreateIndexService,
+        String cause,
+        ProjectId projectId,
+        Settings nodeSettings,
+        ClusterState currentState,
+        long nameResolvedInstant,
+        String dataStreamName,
+        DataStreamOptions dataStreamOptions,
+        SystemDataStreamDescriptor systemDataStreamDescriptor,
+        String exemplarStoreIndexName,
+        @Nullable BiConsumer<ProjectMetadata.Builder, IndexMetadata> metadataTransformer
+    ) throws Exception {
+        final ProjectMetadata projectMetadata = currentState.metadata().getProject(projectId);
+        ComposableIndexTemplate exemplarTemplate = lookupExemplarTemplateForDataStream(projectMetadata, dataStreamOptions, dataStreamName);
+
+        CreateIndexClusterStateUpdateRequest createIndexRequest = new CreateIndexClusterStateUpdateRequest(
+            cause,
+            projectId,
+            exemplarStoreIndexName,
+            exemplarStoreIndexName
+        ).dataStreamName(dataStreamName)
+            .nameResolvedInstant(nameResolvedInstant)
+            .setMatchingTemplate(exemplarTemplate)
+            .settings(MetadataRolloverService.HIDDEN_INDEX_SETTINGS)
+            .isExemplarIndex(true)
+            .systemDataStreamDescriptor(systemDataStreamDescriptor);
+
+        try {
+            currentState = metadataCreateIndexService.applyCreateIndexRequest(
+                currentState,
+                createIndexRequest,
+                false,
+                metadataTransformer,
+                RerouteBehavior.SKIP_REROUTE,
+                AllocationActionListener.rerouteCompletionIsNotRequired()
+            );
+        } catch (ResourceAlreadyExistsException e) {
+            throw new ElasticsearchStatusException(
+                "data stream could not be created because exemplar store index [{}] already exists",
+                RestStatus.BAD_REQUEST,
+                e,
+                exemplarStoreIndexName
             );
         }
         return currentState;

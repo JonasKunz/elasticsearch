@@ -3,6 +3,10 @@ _meta:
   description: Default mappings for the OpenTelemetry metrics index template installed by x-pack
   managed: true
 template:
+  data_stream_options:
+    exemplar_store:
+      enabled: true
+      index_template: metrics-otel-exemplars@template
   settings:
     index.mapping.ignore_malformed: true
     index.mapping.total_fields.limit: 10000

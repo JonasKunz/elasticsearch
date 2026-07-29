@@ -1438,6 +1438,44 @@ public class MetadataIndexTemplateServiceTests extends ESSingleNodeTestCase {
         assertDataStreamOptionsResolution(service, project, List.of(ctFailureStoreEnabled), nullifiedFailureStore, DataStreamOptions.EMPTY);
     }
 
+    public void testResolveExemplarStore() throws Exception {
+        MetadataIndexTemplateService service = getMetadataIndexTemplateService();
+        ProjectMetadata project = ProjectMetadata.builder(randomProjectIdOrDefault()).build();
+
+        String ctExemplarEnabled = "ct_exemplar_enabled";
+        project = addComponentTemplate(
+            service,
+            project,
+            ctExemplarEnabled,
+            new DataStreamOptions.Template(null, new DataStreamExemplarStore.Template(true, null))
+        );
+
+        String ctExemplarTemplate = "ct_exemplar_template";
+        project = addComponentTemplate(
+            service,
+            project,
+            ctExemplarTemplate,
+            new DataStreamOptions.Template(null, new DataStreamExemplarStore.Template(null, "metrics-exemplars"))
+        );
+
+        // Component A: enabled=true; Component B: index_template=metrics-exemplars
+        assertDataStreamOptionsResolution(
+            service,
+            project,
+            List.of(ctExemplarEnabled, ctExemplarTemplate),
+            null,
+            new DataStreamOptions(null, new DataStreamExemplarStore(true, "metrics-exemplars"))
+        );
+
+        // Component A: enabled=true alone cannot be resolved to a valid exemplar store
+        ProjectMetadata projectWithEnabledOnly = project;
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> assertDataStreamOptionsResolution(service, projectWithEnabledOnly, List.of(ctExemplarEnabled), null, null)
+        );
+        assertThat(exception.getMessage(), containsString("index_template"));
+    }
+
     public void testInvalidNonDataStreamTemplateWithDataStreamOptions() throws Exception {
         MetadataIndexTemplateService metadataIndexTemplateService = getMetadataIndexTemplateService();
         Template template = Template.builder().dataStreamOptions(DataStreamOptionsTemplateTests.randomDataStreamOptions()).build();

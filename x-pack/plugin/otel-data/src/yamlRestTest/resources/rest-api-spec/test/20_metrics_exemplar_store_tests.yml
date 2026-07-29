@@ -1,0 +1,21 @@
+---
+setup:
+  - do:
+      cluster.health:
+        wait_for_events: languid
+---
+"metrics-otel exemplar store templates are installed":
+  - do:
+      cluster.get_component_template:
+        name: metrics-otel-exemplars@mappings
+  - match: { component_templates.0.component_template._meta.description: "Default mappings for OpenTelemetry metric exemplars installed by x-pack" }
+  - do:
+      indices.get_index_template:
+        name: metrics-otel-exemplars@template
+  - length: { index_templates: 1 }
+  - match: { index_templates.0.index_template.template.settings.index.mode: "logsdb_columnar" }
+  - do:
+      cluster.get_component_template:
+        name: metrics-otel@mappings
+  - match: { component_templates.0.component_template.template.data_stream_options.exemplar_store.enabled: true }
+  - match: { component_templates.0.component_template.template.data_stream_options.exemplar_store.index_template: "metrics-otel-exemplars@template" }

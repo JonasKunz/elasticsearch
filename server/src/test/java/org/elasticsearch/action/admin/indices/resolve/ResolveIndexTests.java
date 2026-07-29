@@ -60,6 +60,7 @@ import static org.elasticsearch.indices.SystemIndices.SYSTEM_INDEX_ACCESS_CONTRO
 import static org.hamcrest.Matchers.arrayContaining;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.is;
@@ -321,6 +322,39 @@ public class ResolveIndexTests extends ESTestCase {
 
         assertThat(dataStreams.size(), equalTo(1));
         assertThat(dataStreams.get(0).getBackingIndices(), arrayContaining(names));
+    }
+
+    public void testResolveExemplarStoreSelector() {
+        final ProjectId projectId = randomProjectIdOrDefault();
+        ProjectMetadata.Builder builder = ProjectMetadata.builder(projectId);
+        String dataStreamName = "metrics-ds";
+        IndexMetadata backingIndex = createIndexMetadata(DataStream.getDefaultBackingIndexName(dataStreamName, 1, epochMillis), true);
+        IndexMetadata exemplarIndex = createIndexMetadata(DataStream.getDefaultExemplarStoreName(dataStreamName, 1, epochMillis), true);
+        builder.put(backingIndex, false);
+        builder.put(exemplarIndex, false);
+        builder.put(
+            DataStreamTestHelper.newInstance(dataStreamName, List.of(backingIndex.getIndex()), List.of(), List.of(exemplarIndex.getIndex()))
+        );
+        ClusterState clusterState = ClusterState.builder(new ClusterName("_name")).putProjectMetadata(builder.build()).build();
+        projectState = clusterState.projectState(projectId);
+
+        List<ResolvedIndex> indices = new ArrayList<>();
+        List<ResolvedAlias> aliases = new ArrayList<>();
+        List<ResolvedDataStream> dataStreams = new ArrayList<>();
+        TransportAction.resolveIndices(
+            new String[] { dataStreamName + "::exemplars" },
+            IndicesOptions.LENIENT_EXPAND_OPEN,
+            projectState,
+            resolver,
+            indices,
+            aliases,
+            dataStreams,
+            Set.of()
+        );
+        assertThat(dataStreams.size(), equalTo(1));
+        assertThat(dataStreams.get(0).getName(), equalTo(dataStreamName));
+        assertThat(dataStreams.get(0).getBackingIndices(), arrayContaining(exemplarIndex.getIndex().getName()));
+        assertThat(indices, empty());
     }
 
     public void testResolveHiddenProperlyWithDateMath() {

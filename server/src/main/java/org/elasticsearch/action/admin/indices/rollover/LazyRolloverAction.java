@@ -15,6 +15,7 @@ import org.elasticsearch.action.ActionType;
 import org.elasticsearch.action.datastreams.autosharding.DataStreamAutoShardingService;
 import org.elasticsearch.action.support.ActionFilters;
 import org.elasticsearch.action.support.ActiveShardsObserver;
+import org.elasticsearch.action.support.IndexComponentSelector;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.ClusterStateTaskExecutor;
@@ -127,13 +128,14 @@ public final class LazyRolloverAction extends ActionType<RolloverResponse> {
                 rolloverRequest.getRolloverTarget(),
                 rolloverRequest.indicesOptions()
             );
-            boolean isFailureStoreRollover = resolvedRolloverTarget.selector() != null
-                && resolvedRolloverTarget.selector().shouldIncludeFailures();
+            IndexComponentSelector rolloverComponent = resolvedRolloverTarget.selector() == null
+                ? IndexComponentSelector.DATA
+                : resolvedRolloverTarget.selector();
 
             DataStream dataStream = project.dataStreams().get(resolvedRolloverTarget.resource());
             // Skip submitting the task if we detect that the lazy rollover has been already executed.
-            if (isLazyRolloverNeeded(dataStream, isFailureStoreRollover) == false) {
-                DataStream.DataStreamIndices targetIndices = dataStream.getDataStreamIndices(isFailureStoreRollover);
+            if (isLazyRolloverNeeded(dataStream, rolloverComponent) == false) {
+                DataStream.DataStreamIndices targetIndices = dataStream.getDataStreamIndices(rolloverComponent);
                 listener.onResponse(noopLazyRolloverResponse(targetIndices));
                 return;
             }
@@ -143,7 +145,7 @@ public final class LazyRolloverAction extends ActionType<RolloverResponse> {
                 resolvedRolloverTarget.resource(),
                 rolloverRequest.getNewIndexName(),
                 rolloverRequest.getCreateIndexRequest(),
-                isFailureStoreRollover
+                rolloverComponent
             );
             final String trialSourceIndexName = trialRolloverNames.sourceName();
             final String trialRolloverIndexName = trialRolloverNames.rolloverName();
@@ -236,15 +238,16 @@ public final class LazyRolloverAction extends ActionType<RolloverResponse> {
                 rolloverRequest.getRolloverTarget(),
                 rolloverRequest.indicesOptions()
             );
-            boolean isFailureStoreRollover = resolvedRolloverTarget.selector() != null
-                && resolvedRolloverTarget.selector().shouldIncludeFailures();
+            IndexComponentSelector rolloverComponent = resolvedRolloverTarget.selector() == null
+                ? IndexComponentSelector.DATA
+                : resolvedRolloverTarget.selector();
 
             // If the data stream has been rolled over since it was marked for lazy rollover, this operation is a noop
             final DataStream dataStream = currentState.metadata().dataStreams().get(resolvedRolloverTarget.resource());
             assert dataStream != null;
 
-            if (isLazyRolloverNeeded(dataStream, isFailureStoreRollover) == false) {
-                final DataStream.DataStreamIndices targetIndices = dataStream.getDataStreamIndices(isFailureStoreRollover);
+            if (isLazyRolloverNeeded(dataStream, rolloverComponent) == false) {
+                final DataStream.DataStreamIndices targetIndices = dataStream.getDataStreamIndices(rolloverComponent);
                 var noopResponse = noopLazyRolloverResponse(targetIndices);
                 notifyAllListeners(rolloverTaskContexts, context -> context.getTask().listener.onResponse(noopResponse));
                 return currentState.cluster();
@@ -262,7 +265,7 @@ public final class LazyRolloverAction extends ActionType<RolloverResponse> {
                 false,
                 null,
                 null,
-                isFailureStoreRollover
+                rolloverComponent
             );
             results.accept(rolloverResult.sourceIndexName() + "->" + rolloverResult.rolloverIndexName());
             logger.trace("lazy rollover result [{}]", rolloverResult);
@@ -316,9 +319,12 @@ public final class LazyRolloverAction extends ActionType<RolloverResponse> {
      * A lazy rollover is only needed if the data stream is marked to rollover on write or if it targets the failure store
      * and the failure store is empty.
      */
-    private static boolean isLazyRolloverNeeded(DataStream dataStream, boolean failureStore) {
-        DataStream.DataStreamIndices indices = dataStream.getDataStreamIndices(failureStore);
-        return indices.isRolloverOnWrite() || (failureStore && indices.getIndices().isEmpty());
+    private static boolean isLazyRolloverNeeded(DataStream dataStream, IndexComponentSelector rolloverComponent) {
+        DataStream.DataStreamIndices indices = dataStream.getDataStreamIndices(rolloverComponent);
+        if (rolloverComponent == IndexComponentSelector.DATA) {
+            return indices.isRolloverOnWrite();
+        }
+        return indices.isRolloverOnWrite() || indices.getIndices().isEmpty();
     }
 
     private static void notifyAllListeners(

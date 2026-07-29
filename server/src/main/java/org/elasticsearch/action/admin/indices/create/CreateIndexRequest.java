@@ -11,6 +11,7 @@ package org.elasticsearch.action.admin.indices.create;
 
 import org.elasticsearch.ElasticsearchGenerationException;
 import org.elasticsearch.ElasticsearchParseException;
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.IndicesRequest;
 import org.elasticsearch.action.admin.indices.alias.Alias;
@@ -55,6 +56,8 @@ import static org.elasticsearch.common.settings.Settings.readSettingsFromStream;
  */
 public class CreateIndexRequest extends AcknowledgedRequest<CreateIndexRequest> implements IndicesRequest {
 
+    private static final TransportVersion INTRODUCE_EXEMPLAR_STORE = TransportVersion.fromName("introduce_exemplar_store");
+
     public static final ParseField MAPPINGS = new ParseField("mappings");
     public static final ParseField SETTINGS = new ParseField("settings");
     public static final ParseField ALIASES = new ParseField("aliases");
@@ -66,6 +69,8 @@ public class CreateIndexRequest extends AcknowledgedRequest<CreateIndexRequest> 
     private boolean requireDataStream;
 
     private boolean initializeFailureStore;
+
+    private boolean initializeExemplarStore;
 
     private Settings settings = Settings.EMPTY;
     public static final String EMPTY_MAPPINGS = "{}";
@@ -96,6 +101,11 @@ public class CreateIndexRequest extends AcknowledgedRequest<CreateIndexRequest> 
         origin = in.readString();
         requireDataStream = in.readBoolean();
         initializeFailureStore = in.readBoolean();
+        if (in.getTransportVersion().supports(INTRODUCE_EXEMPLAR_STORE)) {
+            initializeExemplarStore = in.readBoolean();
+        } else {
+            initializeExemplarStore = false;
+        }
     }
 
     public CreateIndexRequest() {
@@ -489,6 +499,22 @@ public class CreateIndexRequest extends AcknowledgedRequest<CreateIndexRequest> 
         return this;
     }
 
+    /**
+     * Returns whether the exemplar store should be initialized. N.B. If true, exemplar store index creation will be performed regardless of
+     * whether the template indicates that the exemplar store is enabled.
+     */
+    public boolean isInitializeExemplarStore() {
+        return initializeExemplarStore;
+    }
+
+    /**
+     * Set whether this CreateIndexRequest should initialize the exemplar store on data stream creation.
+     */
+    public CreateIndexRequest initializeExemplarStore(boolean initializeExemplarStore) {
+        this.initializeExemplarStore = initializeExemplarStore;
+        return this;
+    }
+
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
@@ -501,6 +527,9 @@ public class CreateIndexRequest extends AcknowledgedRequest<CreateIndexRequest> 
         out.writeString(origin);
         out.writeBoolean(this.requireDataStream);
         out.writeBoolean(this.initializeFailureStore);
+        if (out.getTransportVersion().supports(INTRODUCE_EXEMPLAR_STORE)) {
+            out.writeBoolean(this.initializeExemplarStore);
+        }
     }
 
     @Override

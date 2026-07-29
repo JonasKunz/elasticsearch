@@ -13,6 +13,7 @@ import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.ResourceNotFoundException;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.datastreams.ModifyDataStreamsAction;
+import org.elasticsearch.action.support.IndexComponentSelector;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
 import org.elasticsearch.cluster.AckedBatchedClusterStateUpdateTask;
 import org.elasticsearch.cluster.AckedClusterStateUpdateTask;
@@ -114,7 +115,7 @@ public class MetadataDataStreamsService {
                         clusterState.projectState(setRolloverOnWriteTask.projectId()),
                         setRolloverOnWriteTask.getDataStreamName(),
                         setRolloverOnWriteTask.rolloverOnWrite(),
-                        setRolloverOnWriteTask.targetFailureStore()
+                        setRolloverOnWriteTask.rolloverComponent()
                     ),
                     setRolloverOnWriteTask
                 );
@@ -311,9 +312,29 @@ public class MetadataDataStreamsService {
         TimeValue masterTimeout,
         ActionListener<AcknowledgedResponse> listener
     ) {
+        setRolloverOnWrite(
+            projectId,
+            dataStreamName,
+            rolloverOnWrite,
+            targetFailureStore ? IndexComponentSelector.FAILURES : IndexComponentSelector.DATA,
+            ackTimeout,
+            masterTimeout,
+            listener
+        );
+    }
+
+    public void setRolloverOnWrite(
+        ProjectId projectId,
+        String dataStreamName,
+        boolean rolloverOnWrite,
+        IndexComponentSelector rolloverComponent,
+        TimeValue ackTimeout,
+        TimeValue masterTimeout,
+        ActionListener<AcknowledgedResponse> listener
+    ) {
         setRolloverOnWriteTaskQueue.submitTask(
             "set-rollover-on-write",
-            new SetRolloverOnWriteTask(projectId, dataStreamName, rolloverOnWrite, targetFailureStore, ackTimeout, listener),
+            new SetRolloverOnWriteTask(projectId, dataStreamName, rolloverOnWrite, rolloverComponent, ackTimeout, listener),
             masterTimeout
         );
     }
@@ -417,27 +438,45 @@ public class MetadataDataStreamsService {
      * @param currentState the initial project state
      * @param dataStreamName the name of the data stream to be updated
      * @param rolloverOnWrite the value of the flag
-     * @param targetFailureStore whether this rollover targets the failure store or the backing indices
+     * @param rolloverComponent whether this rollover targets backing indices, the failure store, or the exemplar store
      * @return the updated cluster state
      */
     public static ClusterState setRolloverOnWrite(
         ProjectState currentState,
         String dataStreamName,
         boolean rolloverOnWrite,
-        boolean targetFailureStore
+        IndexComponentSelector rolloverComponent
     ) {
         var metadata = currentState.metadata();
         var dataStream = validateDataStream(metadata, dataStreamName);
-        var indices = dataStream.getDataStreamIndices(targetFailureStore);
+        var indices = dataStream.getDataStreamIndices(rolloverComponent);
         if (indices.isRolloverOnWrite() == rolloverOnWrite) {
             return currentState.cluster();
         }
         return currentState.updatedState(
             builder -> builder.put(
                 dataStream.copy()
-                    .setDataStreamIndices(targetFailureStore, indices.copy().setRolloverOnWrite(rolloverOnWrite).build())
+                    .setDataStreamIndices(rolloverComponent, indices.copy().setRolloverOnWrite(rolloverOnWrite).build())
                     .build()
             )
+        );
+    }
+
+    /**
+     * @deprecated use {@link #setRolloverOnWrite(ProjectState, String, boolean, IndexComponentSelector)}
+     */
+    @Deprecated
+    public static ClusterState setRolloverOnWrite(
+        ProjectState currentState,
+        String dataStreamName,
+        boolean rolloverOnWrite,
+        boolean targetFailureStore
+    ) {
+        return setRolloverOnWrite(
+            currentState,
+            dataStreamName,
+            rolloverOnWrite,
+            targetFailureStore ? IndexComponentSelector.FAILURES : IndexComponentSelector.DATA
         );
     }
 
@@ -804,6 +843,7 @@ public class MetadataDataStreamsService {
             }
             backingIndicesToRemove.addAll(dataStream.getIndices());
             backingIndicesToRemove.addAll(dataStream.getFailureIndices());
+            backingIndicesToRemove.addAll(dataStream.getExemplarIndices());
         }
 
         // first delete the data streams and then the indices:
@@ -896,13 +936,13 @@ public class MetadataDataStreamsService {
         private final ProjectId projectId;
         private final String dataStreamName;
         private final boolean rolloverOnWrite;
-        private final boolean targetFailureStore;
+        private final IndexComponentSelector rolloverComponent;
 
         SetRolloverOnWriteTask(
             ProjectId projectId,
             String dataStreamName,
             boolean rolloverOnWrite,
-            boolean targetFailureStore,
+            IndexComponentSelector rolloverComponent,
             TimeValue ackTimeout,
             ActionListener<AcknowledgedResponse> listener
         ) {
@@ -910,7 +950,7 @@ public class MetadataDataStreamsService {
             this.projectId = projectId;
             this.dataStreamName = dataStreamName;
             this.rolloverOnWrite = rolloverOnWrite;
-            this.targetFailureStore = targetFailureStore;
+            this.rolloverComponent = rolloverComponent;
         }
 
         public ProjectId projectId() {
@@ -925,8 +965,8 @@ public class MetadataDataStreamsService {
             return rolloverOnWrite;
         }
 
-        public boolean targetFailureStore() {
-            return targetFailureStore;
+        public IndexComponentSelector rolloverComponent() {
+            return rolloverComponent;
         }
     }
 

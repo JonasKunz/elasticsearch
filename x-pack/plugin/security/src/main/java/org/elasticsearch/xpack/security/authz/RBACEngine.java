@@ -962,6 +962,12 @@ public class RBACEngine implements AuthorizationEngine {
                         // we know this is a failure index, and it's authorized so no need to check further
                         continue;
                     }
+                    if (indexAbstraction.isExemplarIndexOfDataStream()
+                        && predicate.test(indexAbstraction.getParentDataStream(), IndexComponentSelector.DATA)) {
+                        indicesAndAliases.add(indexAbstraction.getName());
+                        // we know this is an exemplar index, and it's authorized so no need to check further
+                        continue;
+                    }
                     if (predicate.test(indexAbstraction, IndexComponentSelector.DATA)) {
                         indicesAndAliases.add(indexAbstraction.getName());
                         if (indexAbstraction.getType() == IndexAbstraction.Type.DATA_STREAM) {
@@ -1000,6 +1006,24 @@ public class RBACEngine implements AuthorizationEngine {
                 }
             }
             return indicesAndAliases;
+        }, () -> {
+            // TODO handle time checking in a follow-up
+            Set<String> indicesAndAliases = new HashSet<>();
+            if (includeDataStreams) {
+                for (IndexAbstraction indexAbstraction : lookup.values()) {
+                    if (indexAbstraction.getType() == IndexAbstraction.Type.DATA_STREAM
+                        && predicate.test(indexAbstraction, IndexComponentSelector.EXEMPLARS)) {
+                        DataStream dataStream = (DataStream) indexAbstraction;
+                        if (dataStream.getExemplarIndices().isEmpty() == false) {
+                            indicesAndAliases.add(indexAbstraction.getName());
+                            for (Index index : dataStream.getExemplarIndices()) {
+                                indicesAndAliases.add(index.getName());
+                            }
+                        }
+                    }
+                }
+            }
+            return indicesAndAliases;
         }, (name, selector) -> {
             final IndexAbstraction indexAbstraction = lookup.get(name);
             if (indexAbstraction == null) {
@@ -1017,8 +1041,17 @@ public class RBACEngine implements AuthorizationEngine {
                     if (predicate.test(indexAbstraction.getParentDataStream(), IndexComponentSelector.FAILURES)) {
                         return true;
                     }
+                } else if (indexAbstraction.isExemplarIndexOfDataStream()) {
+                    // access to exemplar indices is authorized via data privileges on the parent data stream
+                    if (predicate.test(indexAbstraction.getParentDataStream(), IndexComponentSelector.DATA)) {
+                        return true;
+                    }
                 } else if (IndexComponentSelector.DATA.equals(selector) || selector == null) {
                     if (predicate.test(indexAbstraction.getParentDataStream(), IndexComponentSelector.DATA)) {
+                        return true;
+                    }
+                } else if (IndexComponentSelector.EXEMPLARS.equals(selector)) {
+                    if (predicate.test(indexAbstraction.getParentDataStream(), IndexComponentSelector.EXEMPLARS)) {
                         return true;
                     }
                 } // we don't support granting access to a backing index with a failure selector via the parent data stream
@@ -1150,24 +1183,29 @@ public class RBACEngine implements AuthorizationEngine {
     static final class AuthorizedIndices implements AuthorizationEngine.AuthorizedIndices {
         private final CachedSupplier<Set<String>> authorizedAndAvailableDataResources;
         private final CachedSupplier<Set<String>> authorizedAndAvailableFailuresResources;
+        private final CachedSupplier<Set<String>> authorizedAndAvailableExemplarsResources;
         private final BiPredicate<String, IndexComponentSelector> isAuthorizedPredicate;
 
         AuthorizedIndices(
             Supplier<Set<String>> authorizedAndAvailableDataResources,
             Supplier<Set<String>> authorizedAndAvailableFailuresResources,
+            Supplier<Set<String>> authorizedAndAvailableExemplarsResources,
             BiPredicate<String, IndexComponentSelector> isAuthorizedPredicate
         ) {
             this.authorizedAndAvailableDataResources = CachedSupplier.wrap(authorizedAndAvailableDataResources);
             this.authorizedAndAvailableFailuresResources = CachedSupplier.wrap(authorizedAndAvailableFailuresResources);
+            this.authorizedAndAvailableExemplarsResources = CachedSupplier.wrap(authorizedAndAvailableExemplarsResources);
             this.isAuthorizedPredicate = Objects.requireNonNull(isAuthorizedPredicate);
         }
 
         @Override
         public Set<String> all(IndexComponentSelector selector) {
             Objects.requireNonNull(selector, "must specify a selector to get authorized indices");
-            return IndexComponentSelector.FAILURES.equals(selector)
-                ? authorizedAndAvailableFailuresResources.get()
-                : authorizedAndAvailableDataResources.get();
+            return switch (selector) {
+                case FAILURES -> authorizedAndAvailableFailuresResources.get();
+                case EXEMPLARS -> authorizedAndAvailableExemplarsResources.get();
+                case DATA -> authorizedAndAvailableDataResources.get();
+            };
         }
 
         @Override

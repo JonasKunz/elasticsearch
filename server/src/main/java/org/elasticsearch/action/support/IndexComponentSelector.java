@@ -24,13 +24,18 @@ import java.util.Map;
  * We define as index components the two different sets of indices a data stream could consist of:
  * - DATA: represents the backing indices
  * - FAILURES: represent the failing indices
- * Note: An index is its own DATA component, but it cannot have a FAILURE component.
+ * - EXEMPLARS: represent the exemplar indices
+ * Note: An index is its own DATA component, but it cannot have a FAILURE or EXEMPLARS component.
  */
 public enum IndexComponentSelector implements Writeable {
     DATA("data", (byte) 0),
-    FAILURES("failures", (byte) 1);
+    FAILURES("failures", (byte) 1),
+    EXEMPLARS("exemplars", (byte) 3);
 
     private static final TransportVersion REMOVE_ALL_APPLICABLE_SELECTOR = TransportVersion.fromName("remove_all_applicable_selector");
+    private static final TransportVersion INTRODUCE_EXEMPLAR_STORE = TransportVersion.fromName("introduce_exemplar_store");
+    private static final String EXEMPLAR_SELECTOR_UNSUPPORTED_MESSAGE =
+        "index component selector [exemplars] is unsupported in this cluster";
 
     private final String key;
     private final byte id;
@@ -94,6 +99,9 @@ public enum IndexComponentSelector implements Writeable {
 
     public static IndexComponentSelector read(StreamInput in) throws IOException {
         byte id = in.readByte();
+        if (id == EXEMPLARS.id && in.getTransportVersion().supports(INTRODUCE_EXEMPLAR_STORE) == false) {
+            throw new IllegalArgumentException(EXEMPLAR_SELECTOR_UNSUPPORTED_MESSAGE);
+        }
         if (in.getTransportVersion().supports(REMOVE_ALL_APPLICABLE_SELECTOR)) {
             return getById(id);
         } else {
@@ -115,6 +123,9 @@ public enum IndexComponentSelector implements Writeable {
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        if (this == EXEMPLARS && out.getTransportVersion().supports(INTRODUCE_EXEMPLAR_STORE) == false) {
+            throw new IllegalArgumentException(EXEMPLAR_SELECTOR_UNSUPPORTED_MESSAGE);
+        }
         out.writeByte(id);
     }
 
@@ -124,5 +135,9 @@ public enum IndexComponentSelector implements Writeable {
 
     public boolean shouldIncludeFailures() {
         return this == FAILURES;
+    }
+
+    public boolean shouldIncludeExemplars() {
+        return this == EXEMPLARS;
     }
 }

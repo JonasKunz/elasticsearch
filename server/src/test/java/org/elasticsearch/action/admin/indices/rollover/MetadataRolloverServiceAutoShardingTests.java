@@ -12,6 +12,7 @@ package org.elasticsearch.action.admin.indices.rollover;
 import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
 import org.elasticsearch.action.datastreams.autosharding.AutoShardingResult;
 import org.elasticsearch.action.datastreams.autosharding.AutoShardingType;
+import org.elasticsearch.action.support.IndexComponentSelector;
 import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.ComposableIndexTemplate;
@@ -118,7 +119,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(INCREASE_SHARDS, 3, 5, TimeValue.ZERO),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), metConditions, 5);
                         assertTelemetry(
@@ -147,7 +148,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                                 false,
                                 null,
                                 new AutoShardingResult(DECREASE_SHARDS, 3, 1, TimeValue.ZERO),
-                                false
+                                IndexComponentSelector.DATA
                             );
                             assertRolloverResult(
                                 dataStream,
@@ -183,7 +184,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                                 false,
                                 null,
                                 new AutoShardingResult(DECREASE_SHARDS, 3, 1, TimeValue.ZERO),
-                                false
+                                IndexComponentSelector.DATA
                             );
                             assertRolloverResult(
                                 dataStream,
@@ -213,7 +214,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(COOLDOWN_PREVENTED_INCREASE, 3, 5, TimeValue.timeValueMinutes(10)),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         // the expected number of shards remains 3 for the data stream due to the remaining cooldown
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), List.of(), 3);
@@ -239,7 +240,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(COOLDOWN_PREVENTED_DECREASE, 3, 1, TimeValue.timeValueMinutes(10)),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         // the expected number of shards remains 3 for the data stream due to the remaining cooldown
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), List.of(), 3);
@@ -266,7 +267,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(NO_CHANGE_REQUIRED, 3, 3, TimeValue.ZERO),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), metConditions, 3);
                         assertTelemetry(
@@ -293,7 +294,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(NOT_APPLICABLE, 1, 1, TimeValue.MAX_VALUE),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), metConditions, 3);
                         assertTelemetry(
@@ -379,7 +380,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(INCREASE_SHARDS, 3, 5, TimeValue.ZERO),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), metConditions, 5);
                         assertTelemetry(
@@ -408,7 +409,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                                 false,
                                 null,
                                 new AutoShardingResult(DECREASE_SHARDS, 3, 1, TimeValue.ZERO),
-                                false
+                                IndexComponentSelector.DATA
                             );
                             assertRolloverResult(
                                 dataStream,
@@ -444,7 +445,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                                 false,
                                 null,
                                 new AutoShardingResult(DECREASE_SHARDS, 3, 1, TimeValue.ZERO),
-                                false
+                                IndexComponentSelector.DATA
                             );
                             assertRolloverResult(
                                 dataStream,
@@ -468,7 +469,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(COOLDOWN_PREVENTED_INCREASE, 3, 5, TimeValue.timeValueMinutes(10)),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         // the expected number of shards remains 3 for the data stream due to the remaining cooldown
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), List.of(), 3);
@@ -494,7 +495,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(COOLDOWN_PREVENTED_DECREASE, 3, 1, TimeValue.timeValueMinutes(10)),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         // the expected number of shards remains 3 for the data stream due to the remaining cooldown
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), List.of(), 3);
@@ -521,7 +522,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(NO_CHANGE_REQUIRED, 3, 3, TimeValue.ZERO),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), metConditions, 3);
                         assertTelemetry(
@@ -548,7 +549,7 @@ public class MetadataRolloverServiceAutoShardingTests extends ESTestCase {
                             false,
                             null,
                             new AutoShardingResult(NOT_APPLICABLE, 1, 1, TimeValue.MAX_VALUE),
-                            false
+                            IndexComponentSelector.DATA
                         );
                         // if the auto sharding is not applicable we just use whatever's in the index template (1 shard in this case)
                         assertRolloverResult(dataStream, rolloverResult, before, testThreadPool.absoluteTimeInMillis(), metConditions, 1);

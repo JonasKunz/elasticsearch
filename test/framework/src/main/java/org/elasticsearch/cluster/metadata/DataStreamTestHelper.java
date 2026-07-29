@@ -75,6 +75,7 @@ import static org.elasticsearch.cluster.metadata.DataStream.BACKING_INDEX_PREFIX
 import static org.elasticsearch.cluster.metadata.DataStream.DATE_FORMATTER;
 import static org.elasticsearch.cluster.metadata.DataStream.FAILURE_STORE_PREFIX;
 import static org.elasticsearch.cluster.metadata.DataStream.getDefaultBackingIndexName;
+import static org.elasticsearch.cluster.metadata.DataStream.getDefaultExemplarStoreName;
 import static org.elasticsearch.cluster.metadata.DataStream.getDefaultFailureStoreName;
 import static org.elasticsearch.cluster.metadata.IndexMetadata.SETTING_INDEX_UUID;
 import static org.elasticsearch.test.ESTestCase.generateRandomStringArray;
@@ -105,6 +106,10 @@ public final class DataStreamTestHelper {
 
     public static DataStream newInstance(String name, List<Index> indices, List<Index> failureIndices) {
         return newInstance(name, indices, indices.size(), null, false, null, failureIndices);
+    }
+
+    public static DataStream newInstance(String name, List<Index> indices, List<Index> failureIndices, List<Index> exemplarIndices) {
+        return newInstance(name, indices, indices.size(), null, false, null, failureIndices, exemplarIndices);
     }
 
     public static DataStream newInstance(String name, List<Index> indices, long generation, Map<String, Object> metadata) {
@@ -156,6 +161,19 @@ public final class DataStreamTestHelper {
         @Nullable DataStreamLifecycle lifecycle,
         List<Index> failureStores
     ) {
+        return newInstance(name, indices, generation, metadata, replicated, lifecycle, failureStores, List.of());
+    }
+
+    public static DataStream newInstance(
+        String name,
+        List<Index> indices,
+        long generation,
+        Map<String, Object> metadata,
+        boolean replicated,
+        @Nullable DataStreamLifecycle lifecycle,
+        List<Index> failureStores,
+        List<Index> exemplarStores
+    ) {
         return newInstance(
             name,
             indices,
@@ -164,6 +182,7 @@ public final class DataStreamTestHelper {
             replicated,
             lifecycle,
             failureStores,
+            exemplarStores,
             failureStores.isEmpty() ? DataStreamOptions.EMPTY : DataStreamOptions.FAILURE_STORE_ENABLED
         );
     }
@@ -178,6 +197,20 @@ public final class DataStreamTestHelper {
         List<Index> failureStores,
         DataStreamOptions dataStreamOptions
     ) {
+        return newInstance(name, indices, generation, metadata, replicated, lifecycle, failureStores, List.of(), dataStreamOptions);
+    }
+
+    public static DataStream newInstance(
+        String name,
+        List<Index> indices,
+        long generation,
+        Map<String, Object> metadata,
+        boolean replicated,
+        DataStreamLifecycle lifecycle,
+        List<Index> failureStores,
+        List<Index> exemplarStores,
+        DataStreamOptions dataStreamOptions
+    ) {
         return DataStream.builder(name, indices)
             .setGeneration(generation)
             .setMetadata(metadata)
@@ -187,6 +220,11 @@ public final class DataStreamTestHelper {
             .setFailureIndices(
                 DataStream.DataStreamIndices.failureIndicesBuilder(failureStores)
                     .setRolloverOnWrite((replicated == false) && (failureStores.isEmpty()))
+                    .build()
+            )
+            .setExemplarIndices(
+                DataStream.DataStreamIndices.exemplarIndicesBuilder(exemplarStores)
+                    .setRolloverOnWrite((replicated == false) && (exemplarStores.isEmpty()))
                     .build()
             )
             .build();
@@ -242,6 +280,27 @@ public final class DataStreamTestHelper {
             .settings(SETTINGS)
             .numberOfShards(NUMBER_OF_SHARDS)
             .numberOfReplicas(NUMBER_OF_REPLICAS);
+    }
+
+    public static IndexMetadata.Builder createFirstExemplarStore(String dataStreamName) {
+        return createExemplarStore(dataStreamName, 1, System.currentTimeMillis());
+    }
+
+    public static IndexMetadata.Builder createExemplarStore(String dataStreamName, int generation, long epochMillis) {
+        return IndexMetadata.builder(getDefaultExemplarStoreName(dataStreamName, generation, epochMillis))
+            .settings(SETTINGS)
+            .numberOfShards(NUMBER_OF_SHARDS)
+            .numberOfReplicas(NUMBER_OF_REPLICAS);
+    }
+
+    public static DataStreamOptions.Template createExemplarDataStreamOptionsTemplate(Boolean enabled, String indexTemplate) {
+        if (enabled == null) {
+            return DataStreamOptions.Template.EMPTY;
+        }
+        return new DataStreamOptions.Template(
+            null,
+            DataStreamExemplarStore.builder().enabled(enabled).indexTemplate(indexTemplate).buildTemplate()
+        );
     }
 
     public static IndexMetadata.Builder getIndexMetadataBuilderForIndex(Index index) {

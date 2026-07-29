@@ -9,15 +9,22 @@
 package org.elasticsearch.action.index;
 
 import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.TransportVersion;
 import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.DocWriteRequest;
 import org.elasticsearch.action.bulk.IndexDocFailureStoreStatus;
 import org.elasticsearch.action.support.ActiveShardCount;
 import org.elasticsearch.action.support.replication.ReplicationResponse;
+import org.elasticsearch.cluster.metadata.DataStream;
 import org.elasticsearch.cluster.metadata.DataStreamAlias;
+import org.elasticsearch.cluster.metadata.DataStreamExemplarStore;
+import org.elasticsearch.cluster.metadata.DataStreamOptions;
 import org.elasticsearch.cluster.metadata.DataStreamTestHelper;
+import org.elasticsearch.cluster.metadata.IndexAbstraction;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.Metadata;
+import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.io.stream.StreamInput;
@@ -535,6 +542,68 @@ public class IndexRequestTests extends ESTestCase {
         assertThat(copy.ifPrimaryTerm(), equalTo(indexRequest.ifPrimaryTerm()));
         assertThat(copy.isRequireDataStream(), equalTo(indexRequest.isRequireDataStream()));
         assertThat(copy.tsid(), equalTo(indexRequest.tsid()));
+    }
+
+    public void testGetConcreteWriteIndexForExemplarStore() {
+        String dataStreamName = "metrics-otel-default";
+        IndexMetadata backingIndex = DataStreamTestHelper.createFirstBackingIndex(dataStreamName, System.currentTimeMillis()).build();
+        IndexMetadata exemplarIndex = DataStreamTestHelper.createFirstExemplarStore(dataStreamName).build();
+        DataStreamOptions options = new DataStreamOptions(null, new DataStreamExemplarStore(true, "metrics-otel-exemplars"));
+        DataStream dataStream = DataStream.builder(dataStreamName, List.of(backingIndex.getIndex()))
+            .setDataStreamOptions(options)
+            .setExemplarIndices(
+                DataStream.DataStreamIndices.exemplarIndicesBuilder(List.of(exemplarIndex.getIndex())).setRolloverOnWrite(false).build()
+            )
+            .build();
+        ProjectMetadata project = ProjectMetadata.builder(randomProjectIdOrDefault())
+            .put(backingIndex, true)
+            .put(exemplarIndex, true)
+            .put(dataStream)
+            .build();
+        IndexAbstraction dataStreamAbstraction = project.getIndicesLookup().get(dataStreamName);
+
+        IndexRequest request = new IndexRequest(dataStreamName).setWriteToExemplarStore(true);
+        assertThat(request.getConcreteWriteIndex(dataStreamAbstraction, project), equalTo(exemplarIndex.getIndex()));
+
+        IndexRequest disabledRequest = new IndexRequest("regular-index").setWriteToExemplarStore(true);
+        IndexAbstraction regularIndex = project.getIndicesLookup().get(backingIndex.getIndex().getName());
+        ElasticsearchException notDataStream = expectThrows(
+            ElasticsearchException.class,
+            () -> disabledRequest.getConcreteWriteIndex(regularIndex, project)
+        );
+        assertThat(notDataStream.getMessage(), containsString("not a data stream"));
+
+        DataStream noExemplarStore = DataStream.builder("no-exemplars", List.of(backingIndex.getIndex())).build();
+        ProjectMetadata projectWithoutExemplar = ProjectMetadata.builder(randomProjectIdOrDefault())
+            .put(backingIndex, true)
+            .put(noExemplarStore)
+            .build();
+        IndexRequest noStoreRequest = new IndexRequest("no-exemplars").setWriteToExemplarStore(true);
+        ElasticsearchException notEnabled = expectThrows(
+            ElasticsearchException.class,
+            () -> noStoreRequest.getConcreteWriteIndex(
+                projectWithoutExemplar.getIndicesLookup().get("no-exemplars"),
+                projectWithoutExemplar
+            )
+        );
+        assertThat(notEnabled.getMessage(), containsString("does not have one enabled"));
+
+        DataStream emptyExemplarComponent = DataStream.builder(dataStreamName, List.of(backingIndex.getIndex()))
+            .setDataStreamOptions(options)
+            .build();
+        ProjectMetadata projectWithEmptyExemplars = ProjectMetadata.builder(randomProjectIdOrDefault())
+            .put(backingIndex, true)
+            .put(emptyExemplarComponent)
+            .build();
+        IndexRequest missingIndexRequest = new IndexRequest(dataStreamName).setWriteToExemplarStore(true);
+        ElasticsearchException noBackingIndex = expectThrows(
+            ElasticsearchException.class,
+            () -> missingIndexRequest.getConcreteWriteIndex(
+                projectWithEmptyExemplars.getIndicesLookup().get(dataStreamName),
+                projectWithEmptyExemplars
+            )
+        );
+        assertThat(noBackingIndex.getMessage(), containsString("does not have an exemplar backing index yet"));
     }
 
     private IndexRequest createTestInstance() {

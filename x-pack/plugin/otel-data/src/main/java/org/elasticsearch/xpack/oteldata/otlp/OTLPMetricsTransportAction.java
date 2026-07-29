@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.oteldata.otlp;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsPartialSuccess;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse;
+import io.opentelemetry.proto.metrics.v1.Exemplar;
 
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.action.ActionType;
@@ -34,13 +35,16 @@ import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
 import org.elasticsearch.xpack.oteldata.OTelPlugin;
+import org.elasticsearch.xpack.oteldata.otlp.datapoint.DataPoint;
 import org.elasticsearch.xpack.oteldata.otlp.datapoint.DataPointGroupingContext;
+import org.elasticsearch.xpack.oteldata.otlp.docbuilder.ExemplarDocumentBuilder;
 import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MappingHints;
 import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MetricDocumentBuilder;
 import org.elasticsearch.xpack.oteldata.otlp.proto.BufferedByteStringAccessor;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -88,10 +92,18 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
             return context;
         }
         MetricDocumentBuilder metricDocumentBuilder = new MetricDocumentBuilder(byteStringAccessor, defaultMappingHints);
+        ExemplarDocumentBuilder exemplarDocumentBuilder = new ExemplarDocumentBuilder(byteStringAccessor);
         ProjectMetadata projectMetadata = clusterService.state().projectState(ProjectId.DEFAULT).metadata();
         Map<String, IndexVersion> indexVersions = new HashMap<>();
         context.consume(
-            dataPointGroup -> addIndexRequest(bulkRequestBuilder, metricDocumentBuilder, dataPointGroup, projectMetadata, indexVersions)
+            dataPointGroup -> addIndexRequests(
+                bulkRequestBuilder,
+                metricDocumentBuilder,
+                exemplarDocumentBuilder,
+                dataPointGroup,
+                projectMetadata,
+                indexVersions
+            )
         );
         return context;
     }
@@ -120,7 +132,19 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
         return IndexVersion.current();
     }
 
-    private void addIndexRequest(
+    private void addIndexRequests(
+        BulkRequestBuilder bulkRequestBuilder,
+        MetricDocumentBuilder metricDocumentBuilder,
+        ExemplarDocumentBuilder exemplarDocumentBuilder,
+        DataPointGroupingContext.DataPointGroup dataPointGroup,
+        ProjectMetadata projectMetadata,
+        Map<String, IndexVersion> indexVersions
+    ) throws IOException {
+        addMetricIndexRequest(bulkRequestBuilder, metricDocumentBuilder, dataPointGroup, projectMetadata, indexVersions);
+        addExemplarIndexRequests(bulkRequestBuilder, exemplarDocumentBuilder, dataPointGroup, projectMetadata, indexVersions);
+    }
+
+    private void addMetricIndexRequest(
         BulkRequestBuilder bulkRequestBuilder,
         MetricDocumentBuilder metricDocumentBuilder,
         DataPointGroupingContext.DataPointGroup dataPointGroup,
@@ -150,6 +174,35 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
                 indexRequest.tsid(tsid);
             }
             bulkRequestBuilder.add(indexRequest);
+        }
+    }
+
+    private void addExemplarIndexRequests(
+        BulkRequestBuilder bulkRequestBuilder,
+        ExemplarDocumentBuilder exemplarDocumentBuilder,
+        DataPointGroupingContext.DataPointGroup dataPointGroup,
+        ProjectMetadata projectMetadata,
+        Map<String, IndexVersion> indexVersions
+    ) throws IOException {
+        String dataStreamName = dataPointGroup.targetIndex().index();
+        IndexVersion indexVersion = indexVersions.computeIfAbsent(dataStreamName, name -> resolveIndexVersion(projectMetadata, name));
+        String exemplarTarget = ExemplarIndexTarget.forDataStream(dataStreamName);
+        List<DataPoint> dataPoints = dataPointGroup.dataPoints();
+        for (int i = 0, dataPointsSize = dataPoints.size(); i < dataPointsSize; i++) {
+            DataPoint dataPoint = dataPoints.get(i);
+            List<Exemplar> exemplars = dataPoint.getExemplars();
+            for (int j = 0, exemplarsSize = exemplars.size(); j < exemplarsSize; j++) {
+                Exemplar exemplar = exemplars.get(j);
+                try (XContentBuilder xContentBuilder = XContentFactory.cborBuilder(new BytesStreamOutput())) {
+                    exemplarDocumentBuilder.buildExemplarDocument(xContentBuilder, dataPointGroup, dataPoint, exemplar, indexVersion);
+                    bulkRequestBuilder.add(
+                        new IndexRequest(exemplarTarget).opType(DocWriteRequest.OpType.CREATE)
+                            .setRequireDataStream(true)
+                            .source(xContentBuilder)
+                            .setIncludeSourceOnError(false)
+                    );
+                }
+            }
         }
     }
 }

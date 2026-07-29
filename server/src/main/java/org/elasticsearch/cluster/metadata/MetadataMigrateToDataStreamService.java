@@ -180,6 +180,7 @@ public class MetadataMigrateToDataStreamService {
             RerouteBehavior.PERFORM_REROUTE,
             listener,
             // No need to initialize the failure store when migrating to a data stream.
+            false,
             false
         );
     }

@@ -27,8 +27,8 @@ public record IndexComponentSelectorPredicate(Set<String> names, Predicate<Index
 
     public static final IndexComponentSelectorPredicate ALL = new IndexComponentSelectorPredicate("all", Predicates.always());
     public static final IndexComponentSelectorPredicate DATA = new IndexComponentSelectorPredicate(
-        "data",
-        IndexComponentSelector.DATA::equals
+        Set.of("data", "exemplars"),
+        selector -> IndexComponentSelector.DATA.equals(selector) || IndexComponentSelector.EXEMPLARS.equals(selector)
     );
     public static final IndexComponentSelectorPredicate FAILURES = new IndexComponentSelectorPredicate(
         "failures",

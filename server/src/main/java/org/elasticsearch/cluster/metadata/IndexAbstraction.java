@@ -49,6 +49,16 @@ public interface IndexAbstraction {
     }
 
     /**
+     * It retrieves the exemplar indices of an index abstraction given it supports the exemplar store.
+     * @param metadata certain abstractions require the project metadata to lazily retrieve the exemplar indices.
+     * @return All concrete exemplar indices this index abstraction is referring to. If the exemplar store is
+     * not supported, it returns an empty list.
+     */
+    default List<Index> getExemplarIndices(@Nullable ProjectMetadata metadata) {
+        return List.of();
+    }
+
+    /**
      * A write index is a dedicated concrete index, that accepts all the new documents that belong to an index abstraction.
      * <p>
      * A write index may also be a regular concrete index of a index abstraction and may therefore also be returned
@@ -69,6 +79,18 @@ public interface IndexAbstraction {
      */
     @Nullable
     default Index getWriteFailureIndex(ProjectMetadata metadata) {
+        return null;
+    }
+
+    /**
+     * A write exemplar index is a dedicated concrete index, that accepts all the new documents that belong to the exemplar store of
+     * an index abstraction. Only an index abstraction with true {@link #isDataStreamRelated()} supports an exemplar store.
+     * @param metadata certain index abstractions require the project metadata to lazily retrieve the exemplar indices
+     * @return the write exemplar index of this index abstraction or <code>null</code> if this index abstraction doesn't have
+     * a write exemplar index or it does not support the exemplar store.
+     */
+    @Nullable
+    default Index getWriteExemplarIndex(ProjectMetadata metadata) {
         return null;
     }
 
@@ -104,6 +126,13 @@ public interface IndexAbstraction {
      * @return whether this index abstraction is a failure index of a data stream
      */
     default boolean isFailureIndexOfDataStream() {
+        return false;
+    }
+
+    /**
+     * @return whether this index abstraction is an exemplar index of a data stream
+     */
+    default boolean isExemplarIndexOfDataStream() {
         return false;
     }
 
@@ -205,6 +234,11 @@ public interface IndexAbstraction {
         @Override
         public boolean isFailureIndexOfDataStream() {
             return getParentDataStream() != null && getParentDataStream().isFailureStoreIndex(getName());
+        }
+
+        @Override
+        public boolean isExemplarIndexOfDataStream() {
+            return getParentDataStream() != null && getParentDataStream().isExemplarStoreIndex(getName());
         }
 
         @Override
@@ -321,6 +355,22 @@ public interface IndexAbstraction {
             return failureIndices;
         }
 
+        @Override
+        public List<Index> getExemplarIndices(ProjectMetadata metadata) {
+            if (isDataStreamRelated() == false) {
+                return List.of();
+            }
+            assert metadata != null : "metadata must not be null to be able to retrieve the exemplar indices";
+            List<Index> exemplarIndices = new ArrayList<>();
+            for (String dataStreamName : dataStreams) {
+                DataStream dataStream = metadata.dataStreams().get(dataStreamName);
+                if (dataStream != null && dataStream.getExemplarIndices().isEmpty() == false) {
+                    exemplarIndices.addAll(dataStream.getExemplarIndices());
+                }
+            }
+            return exemplarIndices;
+        }
+
         @Nullable
         public Index getWriteIndex() {
             return writeIndex;
@@ -335,6 +385,17 @@ public interface IndexAbstraction {
             assert metadata != null : "metadata must not be null to be able to retrieve the failure indices";
             DataStream dataStream = metadata.getIndicesLookup().get(writeIndex.getName()).getParentDataStream();
             return dataStream == null ? null : dataStream.getWriteFailureIndex();
+        }
+
+        @Nullable
+        @Override
+        public Index getWriteExemplarIndex(ProjectMetadata metadata) {
+            if (isDataStreamRelated() == false || writeIndex == null) {
+                return null;
+            }
+            assert metadata != null : "metadata must not be null to be able to retrieve the exemplar indices";
+            DataStream dataStream = metadata.getIndicesLookup().get(writeIndex.getName()).getParentDataStream();
+            return dataStream == null ? null : dataStream.getWriteExemplarIndex(metadata);
         }
 
         @Override

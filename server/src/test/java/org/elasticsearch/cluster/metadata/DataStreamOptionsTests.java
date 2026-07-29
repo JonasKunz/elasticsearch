@@ -16,6 +16,7 @@ import org.elasticsearch.xcontent.XContentParser;
 
 import java.io.IOException;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.nullValue;
 
@@ -34,10 +35,11 @@ public class DataStreamOptionsTests extends AbstractXContentSerializingTestCase<
     }
 
     public static DataStreamOptions randomDataStreamOptions() {
-        return switch (randomIntBetween(0, 2)) {
+        return switch (randomIntBetween(0, 3)) {
             case 0 -> DataStreamOptions.EMPTY;
             case 1 -> DataStreamOptions.FAILURE_STORE_DISABLED;
             case 2 -> DataStreamOptions.FAILURE_STORE_ENABLED;
+            case 3 -> new DataStreamOptions(null, DataStreamExemplarStoreTests.randomExemplarStore());
             default -> throw new IllegalArgumentException("Illegal randomisation branch");
         };
     }
@@ -45,12 +47,26 @@ public class DataStreamOptionsTests extends AbstractXContentSerializingTestCase<
     @Override
     protected DataStreamOptions mutateInstance(DataStreamOptions instance) throws IOException {
         var failureStore = instance.failureStore();
-        if (failureStore == null) {
-            failureStore = DataStreamFailureStoreTests.randomFailureStore();
-        } else {
-            failureStore = randomBoolean() ? null : randomValueOtherThan(failureStore, DataStreamFailureStoreTests::randomFailureStore);
+        var exemplarStore = instance.exemplarStore();
+        if (failureStore == null && exemplarStore == null) {
+            return randomBoolean()
+                ? new DataStreamOptions(DataStreamFailureStoreTests.randomFailureStore(), null)
+                : new DataStreamOptions(null, DataStreamExemplarStoreTests.randomExemplarStore());
         }
-        return new DataStreamOptions(failureStore);
+        switch (randomIntBetween(0, 2)) {
+            case 0 -> failureStore = failureStore == null ? DataStreamFailureStoreTests.randomFailureStore()
+                : randomBoolean() ? null
+                : randomValueOtherThan(failureStore, DataStreamFailureStoreTests::randomFailureStore);
+            case 1 -> exemplarStore = exemplarStore == null ? DataStreamExemplarStoreTests.randomExemplarStore()
+                : randomBoolean() ? null
+                : randomValueOtherThan(exemplarStore, DataStreamExemplarStoreTests::randomExemplarStore);
+            case 2 -> {
+                failureStore = DataStreamFailureStoreTests.randomFailureStore();
+                exemplarStore = DataStreamExemplarStoreTests.randomExemplarStore();
+            }
+            default -> throw new IllegalArgumentException("Illegal randomisation branch");
+        }
+        return new DataStreamOptions(failureStore, exemplarStore);
     }
 
     @Override
@@ -74,5 +90,29 @@ public class DataStreamOptionsTests extends AbstractXContentSerializingTestCase<
         );
         result = copyInstance(withoutEnabled, SETTINGS_IN_DATA_STREAMS);
         assertThat(result, equalTo(DataStreamOptions.EMPTY));
+
+        DataStreamOptions withExemplarStore = new DataStreamOptions(null, new DataStreamExemplarStore(true, "metrics-exemplars-template"));
+        result = copyInstance(withExemplarStore, TransportVersion.fromName("introduce_exemplar_store"));
+        assertThat(result.exemplarStore().enabled(), equalTo(true));
+        assertThat(result.exemplarStore().indexTemplate(), equalTo("metrics-exemplars-template"));
+
+        result = copyInstance(withExemplarStore, SETTINGS_IN_DATA_STREAMS);
+        assertThat(result.exemplarStore(), nullValue());
+    }
+
+    public void testExemplarStoreTemplateComposition() {
+        DataStreamOptions.Template enabledOnly = new DataStreamOptions.Template(null, new DataStreamExemplarStore.Template(true, null));
+        DataStreamOptions.Template templateOnly = new DataStreamOptions.Template(
+            null,
+            new DataStreamExemplarStore.Template(null, "metrics-exemplars")
+        );
+        DataStreamOptions resolved = DataStreamOptions.builder(enabledOnly).composeTemplate(templateOnly).build();
+        assertThat(resolved.exemplarStore(), equalTo(new DataStreamExemplarStore(true, "metrics-exemplars")));
+
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> DataStreamOptions.builder(enabledOnly).build()
+        );
+        assertThat(exception.getMessage(), containsString("index_template"));
     }
 }

@@ -42,6 +42,7 @@ public class DataStreamFeatures implements FeatureSpecification {
     public Set<NodeFeature> getFeatures() {
         return Set.of(
             DataStream.DATA_STREAM_FAILURE_STORE_FEATURE,
+            DataStream.DATA_STREAM_EXEMPLAR_STORE_FEATURE,
             DATA_STREAMS_MODIFY_DELETE_INDEX,
             DataStream.TIME_SERIES_PAST_INDEX_CREATION_FEATURE
         );

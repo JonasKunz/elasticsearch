@@ -56,6 +56,7 @@ import org.elasticsearch.tasks.Task;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportService;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -293,14 +294,20 @@ public final class AutoCreateAction extends ActionType<CreateIndexResponse> {
                         currentState,
                         RerouteBehavior.SKIP_REROUTE,
                         rerouteCompletionIsNotRequired(),
-                        request.isInitializeFailureStore()
+                        request.isInitializeFailureStore(),
+                        request.isInitializeExemplarStore()
                     );
 
                     final var dataStream = clusterState.metadata().getProject(projectId).dataStreams().get(request.index());
                     final var backingIndexName = dataStream.getIndices().get(0).getName();
-                    final var indexNames = dataStream.getFailureIndices().isEmpty()
-                        ? List.of(backingIndexName)
-                        : List.of(backingIndexName, dataStream.getFailureIndices().get(0).getName());
+                    final List<String> indexNames = new ArrayList<>();
+                    indexNames.add(backingIndexName);
+                    if (dataStream.getFailureIndices().isEmpty() == false) {
+                        indexNames.add(dataStream.getFailureIndices().get(0).getName());
+                    }
+                    if (dataStream.getExemplarIndices().isEmpty() == false) {
+                        indexNames.add(dataStream.getExemplarIndices().get(0).getName());
+                    }
                     taskContext.success(getAckListener(indexNames, allocationActionMultiListener));
                     successfulRequests.put(request, indexNames);
                     return clusterState;

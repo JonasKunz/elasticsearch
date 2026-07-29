@@ -17,6 +17,7 @@ import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
 import org.elasticsearch.action.datastreams.autosharding.AutoShardingResult;
 import org.elasticsearch.action.datastreams.autosharding.AutoShardingType;
 import org.elasticsearch.action.support.ActiveShardCount;
+import org.elasticsearch.action.support.IndexComponentSelector;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.ProjectState;
 import org.elasticsearch.cluster.metadata.AliasAction;
@@ -150,7 +151,7 @@ public class MetadataRolloverService {
         boolean onlyValidate,
         @Nullable IndexMetadataStats sourceIndexStats,
         @Nullable AutoShardingResult autoShardingResult,
-        boolean isFailureStoreRollover
+        IndexComponentSelector rolloverComponent
     ) throws Exception {
         validate(currentState.metadata(), rolloverTarget, newIndexName, createIndexRequest);
         final IndexAbstraction indexAbstraction = currentState.metadata().getIndicesLookup().get(rolloverTarget);
@@ -176,7 +177,7 @@ public class MetadataRolloverService {
                 onlyValidate,
                 sourceIndexStats,
                 autoShardingResult,
-                isFailureStoreRollover
+                rolloverComponent
             );
             default ->
                 // the validate method above prevents this case
@@ -192,13 +193,13 @@ public class MetadataRolloverService {
         String rolloverTarget,
         String newIndexName,
         CreateIndexRequest createIndexRequest,
-        boolean isFailureStoreRollover
+        IndexComponentSelector rolloverComponent
     ) {
         validate(project, rolloverTarget, newIndexName, createIndexRequest);
         final IndexAbstraction indexAbstraction = project.getIndicesLookup().get(rolloverTarget);
         return switch (indexAbstraction.getType()) {
             case ALIAS -> resolveAliasRolloverNames(project, indexAbstraction, newIndexName);
-            case DATA_STREAM -> resolveDataStreamRolloverNames(project, (DataStream) indexAbstraction, isFailureStoreRollover);
+            case DATA_STREAM -> resolveDataStreamRolloverNames(project, (DataStream) indexAbstraction, rolloverComponent);
             default ->
                 // the validate method above prevents this case
                 throw new IllegalStateException("unable to roll over type [" + indexAbstraction.getType().getDisplayName() + "]");
@@ -220,10 +221,10 @@ public class MetadataRolloverService {
     private static NameResolution resolveDataStreamRolloverNames(
         ProjectMetadata project,
         DataStream dataStream,
-        boolean isFailureStoreRollover
+        IndexComponentSelector rolloverComponent
     ) {
-        final DataStream.DataStreamIndices dataStreamIndices = dataStream.getDataStreamIndices(isFailureStoreRollover);
-        assert dataStreamIndices.getIndices().isEmpty() == false || isFailureStoreRollover
+        final DataStream.DataStreamIndices dataStreamIndices = dataStream.getDataStreamIndices(rolloverComponent);
+        assert dataStreamIndices.getIndices().isEmpty() == false || rolloverComponent != IndexComponentSelector.DATA
             : "Unable to roll over dataStreamIndices with no indices";
 
         final String originalWriteIndex = dataStreamIndices.getIndices().isEmpty() && dataStreamIndices.isRolloverOnWrite()
@@ -302,7 +303,7 @@ public class MetadataRolloverService {
         boolean onlyValidate,
         @Nullable IndexMetadataStats sourceIndexStats,
         @Nullable AutoShardingResult autoShardingResult,
-        boolean isFailureStoreRollover
+        IndexComponentSelector rolloverComponent
     ) throws Exception {
         final ProjectMetadata metadata = projectState.metadata();
         Set<String> snapshottingDataStreams = SnapshotsServiceUtils.snapshottingDataStreams(
@@ -333,7 +334,7 @@ public class MetadataRolloverService {
             templateV2 = systemDataStreamDescriptor.getComposableIndexTemplate();
         }
 
-        final DataStream.DataStreamIndices dataStreamIndices = dataStream.getDataStreamIndices(isFailureStoreRollover);
+        final DataStream.DataStreamIndices dataStreamIndices = dataStream.getDataStreamIndices(rolloverComponent);
         final boolean isLazyCreation = dataStreamIndices.getIndices().isEmpty() && dataStreamIndices.isRolloverOnWrite();
         final Index originalWriteIndex = isLazyCreation ? null : dataStreamIndices.getWriteIndex();
         final Tuple<String, Long> nextIndexAndGeneration = dataStream.nextWriteIndexAndGeneration(metadata, dataStreamIndices);
@@ -350,7 +351,7 @@ public class MetadataRolloverService {
         }
 
         ClusterState newState;
-        if (isFailureStoreRollover) {
+        if (rolloverComponent == IndexComponentSelector.FAILURES) {
             newState = MetadataCreateDataStreamService.createFailureStoreIndex(
                 createIndexService,
                 "rollover_failure_store",
@@ -363,6 +364,20 @@ public class MetadataRolloverService {
                 systemDataStreamDescriptor,
                 newWriteIndexName,
                 (builder, indexMetadata) -> builder.put(dataStream.rolloverFailureStore(indexMetadata.getIndex(), newGeneration))
+            );
+        } else if (rolloverComponent == IndexComponentSelector.EXEMPLARS) {
+            newState = MetadataCreateDataStreamService.createExemplarStoreIndex(
+                createIndexService,
+                "rollover_exemplar_store",
+                projectState.projectId(),
+                clusterService.getSettings(),
+                projectState.cluster(),
+                now.toEpochMilli(),
+                dataStreamName,
+                dataStream.getDataStreamOptions(),
+                systemDataStreamDescriptor,
+                newWriteIndexName,
+                (builder, indexMetadata) -> builder.put(dataStream.rolloverExemplarStore(indexMetadata.getIndex(), newGeneration))
             );
         } else {
             if (autoShardingResult != null) {
@@ -458,7 +473,7 @@ public class MetadataRolloverService {
             newState.projectState(projectState.projectId()),
             dataStreamName,
             false,
-            isFailureStoreRollover
+            rolloverComponent
         );
 
         return new RolloverResult(newWriteIndexName, isLazyCreation ? NON_EXISTENT_SOURCE : originalWriteIndex.getName(), newState);

@@ -14,6 +14,7 @@ import org.elasticsearch.action.admin.indices.alias.Alias;
 import org.elasticsearch.action.admin.indices.create.CreateIndexClusterStateUpdateRequest;
 import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
 import org.elasticsearch.action.support.ActiveShardCount;
+import org.elasticsearch.action.support.IndexComponentSelector;
 import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.AliasAction;
@@ -573,7 +574,7 @@ public class MetadataRolloverServiceTests extends ESTestCase {
                 false,
                 null,
                 null,
-                false
+                IndexComponentSelector.DATA
             );
             long after = testThreadPool.absoluteTimeInMillis();
 
@@ -651,7 +652,7 @@ public class MetadataRolloverServiceTests extends ESTestCase {
                 false,
                 null,
                 null,
-                false
+                IndexComponentSelector.DATA
             );
             long after = testThreadPool.absoluteTimeInMillis();
             Settings rolledOverIndexSettings = rolloverResult.clusterState()
@@ -741,7 +742,7 @@ public class MetadataRolloverServiceTests extends ESTestCase {
                 false,
                 null,
                 null,
-                true
+                IndexComponentSelector.FAILURES
             );
             long after = testThreadPool.absoluteTimeInMillis();
             Settings rolledOverIndexSettings = rolloverResult.clusterState()
@@ -788,14 +789,14 @@ public class MetadataRolloverServiceTests extends ESTestCase {
         final var now = Instant.now();
         final var projectId = randomProjectIdOrDefault();
         ProjectMetadata.Builder builder = ProjectMetadata.builder(projectId);
-        boolean isFailureStoreRollover = false;
+        IndexComponentSelector rolloverComponent = IndexComponentSelector.DATA;
         if (useDataStream) {
             // ensure no replicate data stream
             DataStream dataStream = DataStreamTestHelper.randomInstance(now::toEpochMilli).promoteDataStream();
             rolloverTarget = dataStream.getName();
             if (dataStream.isFailureStoreExplicitlyEnabled() && randomBoolean()) {
                 sourceIndexName = dataStream.getWriteFailureIndex().getName();
-                isFailureStoreRollover = true;
+                rolloverComponent = IndexComponentSelector.FAILURES;
                 defaultRolloverIndexName = DataStream.getDefaultFailureStoreName(
                     dataStream.getName(),
                     dataStream.getGeneration() + 1,
@@ -859,7 +860,7 @@ public class MetadataRolloverServiceTests extends ESTestCase {
             true,
             null,
             null,
-            isFailureStoreRollover
+            rolloverComponent
         );
 
         newIndexName = newIndexName == null ? defaultRolloverIndexName : newIndexName;
@@ -906,7 +907,7 @@ public class MetadataRolloverServiceTests extends ESTestCase {
                 randomBoolean(),
                 null,
                 null,
-                false
+                IndexComponentSelector.DATA
             )
         );
         assertThat(e.getMessage(), equalTo("no matching index template found for data stream [" + dataStream.getName() + "]"));

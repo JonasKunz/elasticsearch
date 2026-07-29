@@ -10,6 +10,7 @@
 package org.elasticsearch.action.admin.indices.create;
 
 import org.elasticsearch.ElasticsearchParseException;
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.action.admin.indices.alias.Alias;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
@@ -17,6 +18,7 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.index.RandomCreateIndexGenerator;
 import org.elasticsearch.test.AbstractWireSerializingTestCase;
+import org.elasticsearch.test.TransportVersionUtils;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
 import org.elasticsearch.xcontent.XContentType;
@@ -29,6 +31,18 @@ import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.Matchers.containsString;
 
 public class CreateIndexRequestTests extends AbstractWireSerializingTestCase<CreateIndexRequest> {
+
+    private static final TransportVersion INTRODUCE_EXEMPLAR_STORE = TransportVersion.fromName("introduce_exemplar_store");
+
+    public void testInitializeExemplarStoreBackwardCompatibility() throws IOException {
+        CreateIndexRequest request = new CreateIndexRequest("metrics-otel").initializeExemplarStore(true);
+
+        CreateIndexRequest roundTripped = copyInstance(request, INTRODUCE_EXEMPLAR_STORE);
+        assertTrue(roundTripped.isInitializeExemplarStore());
+
+        CreateIndexRequest legacyRoundTripped = copyInstance(request, TransportVersionUtils.getPreviousVersion(INTRODUCE_EXEMPLAR_STORE));
+        assertFalse(legacyRoundTripped.isInitializeExemplarStore());
+    }
 
     public void testSimpleSerialization() throws IOException {
         CreateIndexRequest request = new CreateIndexRequest("foo");

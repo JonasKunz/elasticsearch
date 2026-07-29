@@ -2078,6 +2078,10 @@ public class ProjectMetadata implements Iterable<IndexMetadata>, Diffable<Projec
                     .getIndices()
                     .stream()
                     .anyMatch(index -> indexMetadata.getIndex().getName().equals(index.getName()))
+                || parent.getExemplarComponent()
+                    .getIndices()
+                    .stream()
+                    .anyMatch(index -> indexMetadata.getIndex().getName().equals(index.getName()))
                 : "Expected data stream [" + parent.getName() + "] to contain index " + indexMetadata.getIndex();
             return true;
         }
@@ -2100,6 +2104,9 @@ public class ProjectMetadata implements Iterable<IndexMetadata>, Diffable<Projec
                     indexToDataStreamLookup.put(i.getName(), dataStream);
                 }
                 for (Index i : dataStream.getFailureIndices()) {
+                    indexToDataStreamLookup.put(i.getName(), dataStream);
+                }
+                for (Index i : dataStream.getExemplarIndices()) {
                     indexToDataStreamLookup.put(i.getName(), dataStream);
                 }
             }

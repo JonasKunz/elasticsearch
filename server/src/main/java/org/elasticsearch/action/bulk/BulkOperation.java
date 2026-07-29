@@ -635,7 +635,8 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
         if (failureStoreCandidate != null && clusterHasFailureStoreFeature) {
             // Do not redirect documents to a failure store that were already headed to one.
             var isFailureStoreRequest = isFailureStoreRequest(docWriteRequest);
-            if (shouldRedirectRequestToFailureStore(isFailureStoreRequest, failureStoreCandidate, error)) {
+            var isExemplarStoreRequest = isExemplarStoreRequest(docWriteRequest);
+            if (shouldRedirectRequestToFailureStore(isFailureStoreRequest, isExemplarStoreRequest, failureStoreCandidate, error)) {
                 // Prepare the data stream failure store if necessary
                 maybeMarkFailureStoreForRollover(failureStoreCandidate);
 
@@ -679,6 +680,8 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
      * @param isFailureStoreRequest <code>true</code> if the request being checked was already going to the failure store,
      *                              <code>false</code> if it is a normal doc. Requests already going to the failure store will not be
      *                              redirected a second time.
+     * @param isExemplarStoreRequest <code>true</code> if the request being checked was already going to the exemplar store. Exemplar
+     *                               store write failures are never redirected to the failure store.
      * @param failureStoreCandidate the data stream the original request was being written to, or null if no data stream was involved.
      *                              Requests are only routed to a failure store if they are headed to a data stream with an active failure
      *                              store.
@@ -686,8 +689,15 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
      *              redirected.
      * @return true if the request and error should be redirected to the provided data stream's failure store, false if it should not
      */
-    private boolean shouldRedirectRequestToFailureStore(boolean isFailureStoreRequest, DataStream failureStoreCandidate, Throwable error) {
-        if (isFailureStoreRequest || failureStoreCandidate.isFailureStoreEffectivelyEnabled(dataStreamFailureStoreSettings) == false) {
+    private boolean shouldRedirectRequestToFailureStore(
+        boolean isFailureStoreRequest,
+        boolean isExemplarStoreRequest,
+        DataStream failureStoreCandidate,
+        Throwable error
+    ) {
+        if (isFailureStoreRequest
+            || isExemplarStoreRequest
+            || failureStoreCandidate.isFailureStoreEffectivelyEnabled(dataStreamFailureStoreSettings) == false) {
             return false;
         }
         return switch (error) {
@@ -875,6 +885,10 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
 
     private static boolean isFailureStoreRequest(DocWriteRequest<?> request) {
         return request instanceof IndexRequest ir && ir.isWriteToFailureStore();
+    }
+
+    private static boolean isExemplarStoreRequest(DocWriteRequest<?> request) {
+        return request instanceof IndexRequest ir && ir.isWriteToExemplarStore();
     }
 
     /**

@@ -34,6 +34,8 @@ import org.elasticsearch.cluster.coordination.NoMasterBlockService;
 import org.elasticsearch.cluster.desirednodes.VersionConflictException;
 import org.elasticsearch.cluster.metadata.ComposableIndexTemplate;
 import org.elasticsearch.cluster.metadata.DataStream;
+import org.elasticsearch.cluster.metadata.DataStreamExemplarStore;
+import org.elasticsearch.cluster.metadata.DataStreamFailureStore;
 import org.elasticsearch.cluster.metadata.DataStreamFailureStoreSettings;
 import org.elasticsearch.cluster.metadata.DataStreamOptions;
 import org.elasticsearch.cluster.metadata.DataStreamTestHelper;
@@ -535,6 +537,79 @@ public class BulkOperationTests extends ESTestCase {
             .orElseThrow(() -> new AssertionError("Could not find redirected item"));
         assertThat(failedItem.getFailure().getCause(), is(equalTo(expectedException)));
         assertThat(failedItem.getFailureStoreStatus(), equalTo(IndexDocFailureStoreStatus.NOT_APPLICABLE_OR_UNKNOWN));
+    }
+
+    public void testExemplarStoreWriteFailureIsNotRedirectedToFailureStore() throws Exception {
+        String exemplarDataStreamName = "my_exemplar_store_data_stream";
+        IndexMetadata backingIndex = DataStreamTestHelper.createBackingIndex(exemplarDataStreamName, 1, millis).numberOfShards(2).build();
+        IndexMetadata failureStoreIndex = DataStreamTestHelper.createFailureStore(exemplarDataStreamName, 1, millis)
+            .numberOfShards(1)
+            .build();
+        IndexMetadata exemplarStoreIndex = DataStreamTestHelper.createExemplarStore(exemplarDataStreamName, 1, millis)
+            .numberOfShards(1)
+            .build();
+        DataStream exemplarDataStream = DataStream.builder(exemplarDataStreamName, List.of(backingIndex.getIndex()))
+            .setDataStreamOptions(
+                new DataStreamOptions(new DataStreamFailureStore(true, null), new DataStreamExemplarStore(true, "exemplars-template"))
+            )
+            .setFailureIndices(DataStream.DataStreamIndices.failureIndicesBuilder(List.of(failureStoreIndex.getIndex())).build())
+            .setExemplarIndices(
+                DataStream.DataStreamIndices.exemplarIndicesBuilder(List.of(exemplarStoreIndex.getIndex()))
+                    .setRolloverOnWrite(false)
+                    .build()
+            )
+            .build();
+        ProjectMetadata baseProject = clusterState.metadata().getProject(projectId);
+        var indicesBuilder = new java.util.HashMap<>(baseProject.indices());
+        indicesBuilder.put(backingIndex.getIndex().getName(), backingIndex);
+        indicesBuilder.put(failureStoreIndex.getIndex().getName(), failureStoreIndex);
+        indicesBuilder.put(exemplarStoreIndex.getIndex().getName(), exemplarStoreIndex);
+        var dataStreamsBuilder = new java.util.HashMap<>(baseProject.dataStreams());
+        dataStreamsBuilder.put(exemplarDataStreamName, exemplarDataStream);
+        ClusterState exemplarClusterState = ClusterState.builder(clusterState)
+            .putProjectMetadata(
+                ProjectMetadata.builder(projectId)
+                    .indexTemplates(baseProject.templatesV2())
+                    .indices(indicesBuilder)
+                    .dataStreams(dataStreamsBuilder, baseProject.dataStreamAliases())
+                    .build()
+            )
+            .build();
+
+        BulkRequest bulkRequest = new BulkRequest();
+        bulkRequest.add(
+            new IndexRequest(exemplarDataStreamName).setWriteToExemplarStore(true)
+                .id("1")
+                .source(Map.of("key", "val"))
+                .opType(DocWriteRequest.OpType.CREATE)
+        );
+
+        NodeClient client = getNodeClient(
+            thatFailsDocuments(
+                Map.of(new IndexAndId(exemplarStoreIndex.getIndex().getName(), "1"), () -> new MapperException("exemplar store failure"))
+            )
+        );
+
+        BulkResponse bulkItemResponses = safeAwait(
+            l -> newBulkOperation(
+                exemplarClusterState,
+                client,
+                bulkRequest,
+                new AtomicArray<>(bulkRequest.numberOfActions()),
+                mockObserver(exemplarClusterState),
+                l,
+                new FailureStoreDocumentConverter(),
+                DataStreamFailureStoreSettings.create(ClusterSettings.createBuiltInClusterSettings()),
+                true
+            ).run()
+        );
+        assertThat(bulkItemResponses.hasFailures(), is(true));
+        BulkItemResponse failedItem = bulkItemResponses.getItems()[0];
+        assertThat(failedItem.isFailed(), is(true));
+        assertThat(failedItem.getFailure().getCause(), is(instanceOf(MapperException.class)));
+        assertThat(failedItem.getFailure().getCause().getMessage(), is(equalTo("exemplar store failure")));
+        assertThat(failedItem.getFailureStoreStatus(), equalTo(IndexDocFailureStoreStatus.NOT_APPLICABLE_OR_UNKNOWN));
+        assertThat(failedItem.getIndex(), equalTo(exemplarDataStreamName));
     }
 
     public void testFailingDocumentRedirectsToFailureStoreWhenEnabledByClusterSetting() {

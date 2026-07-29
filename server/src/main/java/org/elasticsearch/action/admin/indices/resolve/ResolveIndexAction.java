@@ -942,6 +942,7 @@ public class ResolveIndexAction extends ActionType<ResolveIndexAction.Response> 
                             : switch (resolvedExpression.selector()) {
                                 case DATA -> dataStream.getDataComponent().getIndices().stream();
                                 case FAILURES -> dataStream.getFailureIndices().stream();
+                                case EXEMPLARS -> dataStream.getExemplarIndices().stream();
                             };
                         String[] backingIndices = dataStreamIndices.filter(filterPredicate).map(Index::getName).toArray(String[]::new);
                         if (indexModes.isEmpty() == false && backingIndices.length == 0) {
@@ -968,6 +969,10 @@ public class ResolveIndexAction extends ActionType<ResolveIndexAction.Response> 
                     case FAILURES -> {
                         assert ia.isDataStreamRelated() : "Illegal selector [failures] used on non data stream alias";
                         yield ia.getFailureIndices(metadata).stream();
+                    }
+                    case EXEMPLARS -> {
+                        assert ia.isDataStreamRelated() : "Illegal selector [exemplars] used on non data stream alias";
+                        yield ia.getExemplarIndices(metadata).stream();
                     }
                 };
             }

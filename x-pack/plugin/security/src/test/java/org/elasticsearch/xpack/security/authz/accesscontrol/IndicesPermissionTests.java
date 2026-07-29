@@ -363,6 +363,89 @@ public class IndicesPermissionTests extends ESTestCase {
         }
     }
 
+    public void testAuthorizeDataStreamAccessWithExemplarsSelector() {
+        ProjectMetadata.Builder builder = ProjectMetadata.builder(randomProjectIdOrDefault());
+        String dataStreamName = randomAlphaOfLength(6);
+        int numBackingIndices = randomIntBetween(1, 3);
+        List<IndexMetadata> backingIndices = new ArrayList<>();
+        for (int backingIndexNumber = 1; backingIndexNumber <= numBackingIndices; backingIndexNumber++) {
+            backingIndices.add(createBackingIndexMetadata(DataStream.getDefaultBackingIndexName(dataStreamName, backingIndexNumber)));
+        }
+        List<IndexMetadata> exemplarIndices = new ArrayList<>();
+        long epochMillis = System.currentTimeMillis();
+        for (int exemplarIndexNumber = 1; exemplarIndexNumber <= 2; exemplarIndexNumber++) {
+            exemplarIndices.add(DataStreamTestHelper.createExemplarStore(dataStreamName, exemplarIndexNumber, epochMillis).build());
+        }
+        DataStream ds = DataStreamTestHelper.newInstance(
+            dataStreamName,
+            backingIndices.stream().map(IndexMetadata::getIndex).collect(Collectors.toList()),
+            List.of(),
+            exemplarIndices.stream().map(IndexMetadata::getIndex).collect(Collectors.toList())
+        );
+        builder.put(ds);
+        for (IndexMetadata index : backingIndices) {
+            builder.put(index, false);
+        }
+        for (IndexMetadata index : exemplarIndices) {
+            builder.put(index, false);
+        }
+        var metadata = builder.build();
+        FieldPermissionsCache fieldPermissionsCache = new FieldPermissionsCache(Settings.EMPTY);
+
+        for (var privilege : List.of(IndexPrivilege.ALL, IndexPrivilege.READ)) {
+            Role role = Role.builder(RESTRICTED_INDICES, "_role")
+                .add(
+                    new FieldPermissions(fieldPermissionDef(null, null)),
+                    null,
+                    privilege,
+                    randomBoolean(),
+                    randomFrom(dataStreamName, dataStreamName + "*")
+                )
+                .build();
+            IndicesAccessControl permissions = role.authorize(
+                TransportSearchAction.TYPE.name(),
+                Sets.newHashSet(dataStreamName + "::exemplars"),
+                metadata,
+                fieldPermissionsCache
+            );
+            assertThat("for privilege " + privilege, permissions.isGranted(), is(true));
+            assertThat("for privilege " + privilege, permissions.hasIndexPermissions(dataStreamName + "::exemplars"), is(true));
+        }
+
+        for (var privilege : List.of(IndexPrivilege.READ_FAILURE_STORE)) {
+            Role role = Role.builder(RESTRICTED_INDICES, "_role")
+                .add(
+                    new FieldPermissions(fieldPermissionDef(null, null)),
+                    null,
+                    privilege,
+                    randomBoolean(),
+                    randomFrom(dataStreamName, dataStreamName + "*")
+                )
+                .build();
+            IndicesAccessControl permissions = role.authorize(
+                TransportSearchAction.TYPE.name(),
+                Sets.newHashSet(dataStreamName + "::exemplars"),
+                metadata,
+                fieldPermissionsCache
+            );
+            assertThat("for privilege " + privilege, permissions.isGranted(), is(false));
+            assertThat("for privilege " + privilege, permissions.hasIndexPermissions(dataStreamName + "::exemplars"), is(false));
+        }
+
+        Role role = Role.builder(RESTRICTED_INDICES, "_role")
+            .add(new FieldPermissions(fieldPermissionDef(null, null)), null, IndexPrivilege.READ, randomBoolean(), dataStreamName)
+            .build();
+        String exemplarIndexName = exemplarIndices.getFirst().getIndex().getName();
+        IndicesAccessControl directExemplarAccess = role.authorize(
+            TransportSearchAction.TYPE.name(),
+            Sets.newHashSet(exemplarIndexName),
+            metadata,
+            fieldPermissionsCache
+        );
+        assertThat(directExemplarAccess.isGranted(), is(true));
+        assertThat(directExemplarAccess.hasIndexPermissions(exemplarIndexName), is(true));
+    }
+
     public void testAuthorizeDataStreamFailureIndices() {
         ProjectMetadata.Builder builder = ProjectMetadata.builder(randomProjectIdOrDefault());
         String dataStreamName = randomAlphaOfLength(6);

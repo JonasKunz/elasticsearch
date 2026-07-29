@@ -73,6 +73,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
             req,
             RerouteBehavior.PERFORM_REROUTE,
             ActionListener.noop(),
+            false,
             false
         );
         final var project = newState.metadata().getProject(projectId);
@@ -110,6 +111,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
             req,
             RerouteBehavior.PERFORM_REROUTE,
             ActionListener.noop(),
+            false,
             false
         );
         final var project = newState.metadata().getProject(projectId);
@@ -147,6 +149,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
             req,
             RerouteBehavior.PERFORM_REROUTE,
             ActionListener.noop(),
+            false,
             false
         );
         final var project = newState.metadata().getProject(projectId);
@@ -190,6 +193,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
             req,
             RerouteBehavior.PERFORM_REROUTE,
             ActionListener.noop(),
+            false,
             false
         );
         final var project = newState.metadata().getProject(projectId);
@@ -269,6 +273,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
             req,
             RerouteBehavior.PERFORM_REROUTE,
             ActionListener.noop(),
+            false,
             false
         );
         final var project = newState.metadata().getProject(projectId);
@@ -326,7 +331,8 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
             req,
             RerouteBehavior.PERFORM_REROUTE,
             ActionListener.noop(),
-            true
+            true,
+            false
         );
         var backingIndexName = DataStream.getDefaultBackingIndexName(dataStreamName, 1, req.startTime());
         var failureStoreIndexName = DataStream.getDefaultFailureStoreName(dataStreamName, 1, req.startTime());
@@ -371,6 +377,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
             req,
             RerouteBehavior.PERFORM_REROUTE,
             ActionListener.noop(),
+            false,
             false
         );
         var backingIndexName = DataStream.getDefaultBackingIndexName(dataStreamName, 1, req.startTime());
@@ -413,7 +420,8 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
             req,
             RerouteBehavior.PERFORM_REROUTE,
             ActionListener.noop(),
-            true
+            true,
+            false
         );
         var backingIndexName = DataStream.getDefaultBackingIndexName(dataStreamName, 1, req.startTime());
         var failureStoreIndexName = DataStream.getDefaultFailureStoreName(dataStreamName, 1, req.startTime());
@@ -450,6 +458,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
             req,
             RerouteBehavior.PERFORM_REROUTE,
             ActionListener.noop(),
+            false,
             false
         );
         final var project = newState.metadata().getProject(projectId);
@@ -487,6 +496,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
                 req,
                 RerouteBehavior.PERFORM_REROUTE,
                 ActionListener.noop(),
+                false,
                 false
             )
         );
@@ -511,6 +521,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
                 req,
                 RerouteBehavior.PERFORM_REROUTE,
                 ActionListener.noop(),
+                false,
                 false
             )
         );
@@ -535,6 +546,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
                 req,
                 RerouteBehavior.PERFORM_REROUTE,
                 ActionListener.noop(),
+                false,
                 false
             )
         );
@@ -559,6 +571,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
                 req,
                 RerouteBehavior.PERFORM_REROUTE,
                 ActionListener.noop(),
+                false,
                 false
             )
         );
@@ -583,6 +596,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
                 req,
                 RerouteBehavior.PERFORM_REROUTE,
                 ActionListener.noop(),
+                false,
                 false
             )
         );
@@ -608,6 +622,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
                 req,
                 RerouteBehavior.PERFORM_REROUTE,
                 ActionListener.noop(),
+                false,
                 false
             )
         );
@@ -648,6 +663,7 @@ public class MetadataCreateDataStreamServiceTests extends ESTestCase {
                 req,
                 RerouteBehavior.PERFORM_REROUTE,
                 ActionListener.noop(),
+                false,
                 false
             )
         );

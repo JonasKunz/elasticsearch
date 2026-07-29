@@ -266,15 +266,3 @@ We can later add a separate exemplar failure store if there is demand, but for n
 The exemplar component rolls over independently from `::data`, based on its own conditions
 (configured in lifecycle or triggered explicitly). This allows short-lived exemplar indices
 without affecting metrics retention.
-
-## Open Questions
-
-- Should the exemplar component be created eagerly (at data stream creation) or lazily (on
-  first exemplar write)?
-- How exactly are component-specific mappings resolved from the composable template? Should
-  this reuse the failure store's mapping resolution mechanism, or introduce a new one?
-- What is the exact syntax and semantics of `TS_EXEMPLARS` in ES|QL? How does it handle
-  wildcards in the FROM clause (e.g. `FROM metrics-*`) that resolve to multiple data streams?
-- What is the default exemplar lifecycle if none is configured (e.g. 7 days)?
-- Should `TS_EXEMPLARS` be the only ES|QL entry point, or should
-  `FROM metrics-otel-default::exemplars` also work as a regular source?

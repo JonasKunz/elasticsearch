@@ -495,6 +495,12 @@ public final class IndicesPermission {
                 : List.of();
         }
 
+        public List<Index> getExemplarIndices(ProjectMetadata metadata) {
+            return indexAbstraction != null && IndexComponentSelector.EXEMPLARS.equals(selector)
+                ? indexAbstraction.getExemplarIndices(metadata)
+                : List.of();
+        }
+
         /**
          * @return {@code true} if-and-only-if this object is related to a data-stream, either by having a
          * {@link IndexAbstraction#getType()} of {@link IndexAbstraction.Type#DATA_STREAM} or by being the backing index for a
@@ -523,6 +529,11 @@ public final class IndicesPermission {
                     // failure indices are special: when accessed directly (not through ::failures on parent data stream) they are accessed
                     // implicitly as data. However, authz to the parent data stream happens via the failures selector
                     if (group.checkSelector(IndexComponentSelector.FAILURES) && group.checkIndex(ds.getName())) {
+                        return true;
+                    }
+                } else if (indexAbstraction.isExemplarIndexOfDataStream()) {
+                    // exemplar indices are authorized via data privileges on the parent data stream
+                    if (group.checkSelector(IndexComponentSelector.DATA) && group.checkIndex(ds.getName())) {
                         return true;
                     }
                 } else if (IndexComponentSelector.DATA.equals(selector) || selector == null) {
@@ -563,6 +574,22 @@ public final class IndicesPermission {
                         size += parentDataStream.getFailureIndices().size();
                     }
                 }
+                if (selector.shouldIncludeExemplars()) {
+                    if (IndexAbstraction.Type.ALIAS.equals(indexAbstraction.getType())) {
+                        Set<DataStream> aliasDataStreams = new HashSet<>();
+                        int exemplarIndices = 0;
+                        for (Index index : indexAbstraction.getIndices()) {
+                            DataStream parentDataStream = lookup.get(index.getName()).getParentDataStream();
+                            if (parentDataStream != null && aliasDataStreams.add(parentDataStream)) {
+                                exemplarIndices += parentDataStream.getExemplarIndices().size();
+                            }
+                        }
+                        size += exemplarIndices;
+                    } else if (IndexAbstraction.Type.DATA_STREAM.equals(indexAbstraction.getType())) {
+                        DataStream parentDataStream = (DataStream) indexAbstraction;
+                        size += parentDataStream.getExemplarIndices().size();
+                    }
+                }
                 return size;
             } else {
                 return 1 + indexAbstraction.getIndices().size();
@@ -571,11 +598,11 @@ public final class IndicesPermission {
 
         /**
          * Returns the collection of concrete indices that this IndexResource resolves to,
-         * including failure indices if the selector is FAILURES.
+         * including failure or exemplar indices when the selector targets those components.
          * In case when the IndexResource is a view or dataset, it returns the abstraction name only.
          * The returned collection is the one that DLS or FLS permissions need to be checked for.
          */
-        public Collection<String> resolveConcreteIndicesViewsAndDatasets(List<Index> failureIndices) {
+        public Collection<String> resolveConcreteIndicesViewsAndDatasets(ProjectMetadata metadata) {
             if (indexAbstraction == null) {
                 return List.of();
             } else if (indexAbstraction.getType() == IndexAbstraction.Type.CONCRETE_INDEX) {
@@ -584,8 +611,16 @@ public final class IndicesPermission {
                 || indexAbstraction.getType() == IndexAbstraction.Type.DATASET) {
                     return List.of(indexAbstraction.getName());
                 } else if (IndexComponentSelector.FAILURES.equals(selector)) {
+                    List<Index> failureIndices = indexAbstraction.getFailureIndices(metadata);
                     final List<String> concreteIndexNames = new ArrayList<>(failureIndices.size());
                     for (var idx : failureIndices) {
+                        concreteIndexNames.add(idx.getName());
+                    }
+                    return concreteIndexNames;
+                } else if (IndexComponentSelector.EXEMPLARS.equals(selector)) {
+                    List<Index> exemplarIndices = indexAbstraction.getExemplarIndices(metadata);
+                    final List<String> concreteIndexNames = new ArrayList<>(exemplarIndices.size());
+                    for (var idx : exemplarIndices) {
                         concreteIndexNames.add(idx.getName());
                     }
                     return concreteIndexNames;
@@ -608,8 +643,10 @@ public final class IndicesPermission {
 
         public String nameWithSelector() {
             String combined = IndexNameExpressionResolver.combineSelector(name, selector);
-            assert false != IndexComponentSelector.FAILURES.equals(selector) || name.equals(combined)
-                : "Only failures selectors should result in explicit selectors suffix";
+            assert name.equals(combined)
+                || IndexComponentSelector.FAILURES.equals(selector)
+                || IndexComponentSelector.EXEMPLARS.equals(selector)
+                : "Only failures and exemplars selectors should result in explicit selectors suffix";
             return combined;
         }
     }
@@ -649,16 +686,13 @@ public final class IndicesPermission {
 
         final boolean overallGranted = isActionGranted(action, resources.values());
         final int finalTotalResourceCount = totalResourceCount;
-        final var failureIndicesByResourceName = resources.entrySet()
-            .stream()
-            .collect(Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue().getFailureIndices(metadata)));
 
         final Supplier<Map<String, IndicesAccessControl.IndexAccessControl>> indexPermissions = () -> buildIndicesAccessControl(
             action,
             resources,
             finalTotalResourceCount,
             fieldPermissionsCache,
-            failureIndicesByResourceName
+            metadata
         );
 
         return new IndicesAccessControl(overallGranted, indexPermissions);
@@ -669,7 +703,7 @@ public final class IndicesPermission {
         final Map<String, IndexResource> requestedResources,
         final int totalResourceCount,
         final FieldPermissionsCache fieldPermissionsCache,
-        final Map<String, List<Index>> failureIndicesByIndexResource
+        final ProjectMetadata metadata
     ) {
 
         // now... every index that is associated with the request, must be granted
@@ -686,9 +720,7 @@ public final class IndicesPermission {
             boolean granted = false;
             final String resourceName = resourceEntry.getKey();
             final IndexResource resource = resourceEntry.getValue();
-            final Collection<String> concreteIndicesViewsAndDatasets = resource.resolveConcreteIndicesViewsAndDatasets(
-                failureIndicesByIndexResource.get(resourceEntry.getKey())
-            );
+            final Collection<String> concreteIndicesViewsAndDatasets = resource.resolveConcreteIndicesViewsAndDatasets(metadata);
             for (Group group : groups) {
                 // the group covers the given index OR the given index is a backing index and the group covers the parent data stream
                 if (resource.checkIndex(group)) {

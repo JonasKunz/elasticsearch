@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.oteldata.otlp.datapoint;
 
 import io.opentelemetry.proto.common.v1.KeyValue;
 import io.opentelemetry.proto.metrics.v1.AggregationTemporality;
+import io.opentelemetry.proto.metrics.v1.Exemplar;
 import io.opentelemetry.proto.metrics.v1.ExponentialHistogramDataPoint;
 import io.opentelemetry.proto.metrics.v1.HistogramDataPoint;
 import io.opentelemetry.proto.metrics.v1.Metric;
@@ -123,6 +124,14 @@ public interface DataPoint {
      */
     long getDocCount();
 
+    /**
+     * Returns exemplars attached to this data point, if any.
+     * Summary data points do not carry exemplars in the OpenTelemetry metrics data model.
+     *
+     * @return the exemplars for this data point
+     */
+    List<Exemplar> getExemplars();
+
     record Number(NumberDataPoint dataPoint, Metric metric) implements DataPoint {
 
         @Override
@@ -206,6 +215,11 @@ public interface DataPoint {
                 return false;
             }
             return true;
+        }
+
+        @Override
+        public List<Exemplar> getExemplars() {
+            return dataPoint.getExemplarsList();
         }
     }
 
@@ -299,6 +313,11 @@ public interface DataPoint {
                 return false;
             }
             return true;
+        }
+
+        @Override
+        public List<Exemplar> getExemplars() {
+            return dataPoint.getExemplarsList();
         }
     }
 
@@ -408,6 +427,11 @@ public interface DataPoint {
             }
             return true;
         }
+
+        @Override
+        public List<Exemplar> getExemplars() {
+            return dataPoint.getExemplarsList();
+        }
     }
 
     private static String getHistogramDynamicTemplate(MappingHints mappingHints) {
@@ -470,6 +494,11 @@ public interface DataPoint {
         @Override
         public boolean isValid(Set<String> errors, MappingHints mappingHints) {
             return true;
+        }
+
+        @Override
+        public List<Exemplar> getExemplars() {
+            return List.of();
         }
     }
 

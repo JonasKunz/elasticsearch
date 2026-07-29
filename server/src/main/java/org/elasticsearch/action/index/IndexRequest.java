@@ -126,6 +126,11 @@ public class IndexRequest extends ReplicatedWriteRequest<IndexRequest> implement
     private boolean writeToFailureStore = false;
 
     /**
+     * Transient flag denoting that the local request should be routed to an exemplar store. Not persisted across the wire.
+     */
+    private boolean writeToExemplarStore = false;
+
+    /**
      * This indicates whether the response to this request ought to list the ingest pipelines that were executed on the document
      */
     private boolean listExecutedPipelines;
@@ -902,6 +907,26 @@ public class IndexRequest extends ReplicatedWriteRequest<IndexRequest> implement
                 );
             }
             return dataStream.getFailureIndices().get(dataStream.getFailureIndices().size() - 1);
+        } else if (writeToExemplarStore) {
+            if (ia.isDataStreamRelated() == false) {
+                throw new ElasticsearchException(
+                    "Attempting to write a document to an exemplar store but the targeted index is not a data stream"
+                );
+            }
+            String defaultWriteIndexName = ia.getWriteIndex().getName();
+            DataStream dataStream = project.getIndicesLookup().get(defaultWriteIndexName).getParentDataStream();
+            if (dataStream.isExemplarStoreExplicitlyEnabled() == false) {
+                throw new ElasticsearchException(
+                    "Attempting to write a document to an exemplar store but the target data stream does not have one enabled"
+                );
+            }
+            Index writeExemplarIndex = dataStream.getWriteExemplarIndex();
+            if (writeExemplarIndex == null) {
+                throw new ElasticsearchException(
+                    "Attempting to write a document to an exemplar store but the target data stream does not have an exemplar backing index yet"
+                );
+            }
+            return writeExemplarIndex;
         } else {
             // Resolve as normal
             return ia.getWriteIndex(this, project);
@@ -938,6 +963,21 @@ public class IndexRequest extends ReplicatedWriteRequest<IndexRequest> implement
      */
     public IndexRequest setWriteToFailureStore(boolean writeToFailureStore) {
         this.writeToFailureStore = writeToFailureStore;
+        return this;
+    }
+
+    /**
+     * Returns a transient flag denoting that the local request should be routed to an exemplar store. Not persisted across the wire.
+     */
+    public boolean isWriteToExemplarStore() {
+        return writeToExemplarStore;
+    }
+
+    /**
+     * Sets a transient flag denoting that the local request should be routed to an exemplar store. Not persisted across the wire.
+     */
+    public IndexRequest setWriteToExemplarStore(boolean writeToExemplarStore) {
+        this.writeToExemplarStore = writeToExemplarStore;
         return this;
     }
 

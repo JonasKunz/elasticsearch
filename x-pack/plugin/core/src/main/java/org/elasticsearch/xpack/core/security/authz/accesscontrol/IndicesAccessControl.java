@@ -63,7 +63,8 @@ public class IndicesAccessControl {
     public IndexAccessControl getIndexPermissions(String index) {
         assert false == IndexNameExpressionResolver.hasSelectorSuffix(index)
             || IndexNameExpressionResolver.hasSelector(index, IndexComponentSelector.FAILURES)
-            : "index name [" + index + "] cannot have explicit selector other than ::failures";
+            || IndexNameExpressionResolver.hasSelector(index, IndexComponentSelector.EXEMPLARS)
+            : "index name [" + index + "] cannot have explicit selector other than ::failures or ::exemplars";
         return getAllIndexPermissions().get(index);
     }
 
