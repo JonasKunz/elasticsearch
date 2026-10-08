@@ -23,6 +23,8 @@ template:
   settings:
     index:
       mode: time_series
+      time_series:
+        batch_indexing: true
   mappings:
     properties:
       data_stream.type:
