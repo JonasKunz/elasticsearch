@@ -10,7 +10,6 @@ package org.elasticsearch.xpack.oteldata.otlp;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsPartialSuccess;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse;
-import io.opentelemetry.proto.common.v1.KeyValue;
 import io.opentelemetry.proto.metrics.v1.Exemplar;
 
 import org.apache.lucene.util.BytesRef;
@@ -76,14 +75,14 @@ import java.util.concurrent.TimeUnit;
  * It also handles the response according to the OpenTelemetry Protocol specifications,
  * including success, partial success responses, and errors due to bad data or server errors.
  *
- * <p>When {@link BatchIndexingEnabled} is active cluster-wide, exemplar ingestion does not apply, and all data-point values and
- * attributes in the request are scalar,
- * (gauges and monotonic sums with string/bool/int/double attributes only), metrics are written
- * directly into an {@link EscfBatch} without a CBOR intermediate representation, and the coordinator
- * derives {@code _tsid} column-major via
- * {@link org.elasticsearch.cluster.routing.ColumnarTsidCalculator}. For all other cases
- * (histograms, summaries, non-scalar attributes, or the setting disabled) the existing XContent path
- * is used unchanged.
+ * <p>When {@link BatchIndexingEnabled} is active cluster-wide and the request targets a single data stream whose
+ * backing indices support batch indexing, the metrics are optimistically written directly into an
+ * {@link EscfBatch} without a CBOR intermediate representation, and the coordinator derives {@code _tsid}
+ * column-major via {@link org.elasticsearch.cluster.routing.ColumnarTsidCalculator}. Only metadata is checked up
+ * front; whether the payload itself is expressible as scalar columns (gauges and monotonic sums with
+ * string/bool/int/double attributes, no exemplars when exemplar ingestion is enabled) is discovered while
+ * writing. If any group turns out to be unsupported, the partially built batch is discarded and the whole request
+ * is written through the existing XContent path instead, so a request is never split across the two paths.
  *
  * @see <a href="https://opentelemetry.io/docs/specs/otlp">OTLP Specification</a>
  */
@@ -142,7 +141,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
 
         ProjectMetadata projectMetadata = clusterService.state().projectState(ProjectId.DEFAULT).metadata();
 
-        // Collect all groups in a single pass so we can check ESCF eligibility before committing any rows.
+        // Collect all groups so the ESCF attempt can be rolled back as a whole if it fails part-way.
         // A BulkRequest carries at most one pre-built batch (keyed by index-abstraction name), so the ESCF
         // path requires all groups to target the same data stream. Groups targeting different data streams
         // fall through to doc-mode. Within a single data stream, BatchModeRouter handles routing to
@@ -152,11 +151,16 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
 
         // Snapshot volatile setting to have it consistent for this request
         boolean exemplarIngestionEnabled = this.exemplarIngestionEnabled;
-        if (canUseBatchIndexing(exemplarIngestionEnabled, projectMetadata, allGroups)) {
-            String firstTarget = allGroups.getFirst().targetIndex().index();
-            MetricColumnarBuilder metricColumnarBuilder = new MetricColumnarBuilder(defaultMappingHints);
-            addEscfBatch(bulkRequestBuilder, metricColumnarBuilder, allGroups, firstTarget);
-            return context;
+
+        // Optimistic ESCF path: only the (cheap) metadata checks happen up front. Whether the payload is
+        // expressible as scalar columns is found out while writing it; on the first unsupported group the
+        // batch is dropped and the whole request is written in doc-mode below.
+        if (canAttemptBatchIndexing(projectMetadata, allGroups)) {
+            String target = allGroups.getFirst().targetIndex().index();
+            MetricColumnarBuilder metricColumnarBuilder = new MetricColumnarBuilder(defaultMappingHints, exemplarIngestionEnabled);
+            if (tryAddEscfBatch(bulkRequestBuilder, metricColumnarBuilder, allGroups, target)) {
+                return context;
+            }
         }
 
         long totalExpandedBytes = 0;
@@ -190,32 +194,23 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
         return context;
     }
 
-    boolean canUseBatchIndexing(
-        boolean exemplarIngestionEnabled,
-        ProjectMetadata projectMetadata,
-        List<DataPointGroupingContext.DataPointGroup> groups
-    ) {
-        if (groups.isEmpty()) {
-            return false;
-        }
-        if (exemplarIngestionEnabled && hasExemplars(groups)) {
+    /**
+     * Metadata-only gate for the ESCF path: batch indexing must be enabled, all groups must target the same
+     * data stream, and every backing index the groups resolve to must support batch indexing. Whether the
+     * payload itself can be written as columns is not checked here; {@link #tryAddEscfBatch} finds that out
+     * while writing and reports it through its return value.
+     */
+    boolean canAttemptBatchIndexing(ProjectMetadata projectMetadata, List<DataPointGroupingContext.DataPointGroup> groups) {
+        if (groups.isEmpty() || batchIndexingEnabled.isEnabled() == false) {
             return false;
         }
         String firstTarget = groups.getFirst().targetIndex().index();
-        return groups.stream().allMatch(group -> firstTarget.equals(group.targetIndex().index()))
-            && isEscfEligible(groups)
-            && resolveEscfEligible(projectMetadata, firstTarget, groups);
-    }
-
-    static boolean hasExemplars(List<DataPointGroupingContext.DataPointGroup> groups) {
-        for (DataPointGroupingContext.DataPointGroup group : groups) {
-            for (DataPoint dataPoint : group.dataPoints()) {
-                if (dataPoint.getExemplars().isEmpty() == false) {
-                    return true;
-                }
+        for (int i = 1; i < groups.size(); i++) {
+            if (firstTarget.equals(groups.get(i).targetIndex().index()) == false) {
+                return false;
             }
         }
-        return false;
+        return resolveEscfEligible(projectMetadata, firstTarget, groups);
     }
 
     // -------------------------------------------------------------------------
@@ -223,50 +218,16 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
     // -------------------------------------------------------------------------
 
     /**
-     * Returns {@code true} when every group in the list can be written as scalar ESCF columns, i.e. all
-     * data points support columnar values and all attributes are scalar (no ARRAY/KVLIST/BYTES values).
+     * Optimistically writes all groups into a single {@link EscfBatch} and registers it, together with one
+     * {@link IndexRequest} per group, on {@code bulkRequestBuilder}.
+     *
+     * <p>Returns {@code false} without modifying {@code bulkRequestBuilder} if any group cannot be expressed
+     * columnar (see {@link MetricColumnarBuilder#buildMetricRow}); the partially built batch is released and
+     * the caller must write the request through the doc-mode path instead. The index requests are therefore
+     * only added to the bulk request once every row has been committed.
      */
-    static boolean isEscfEligible(List<DataPointGroupingContext.DataPointGroup> groups) {
-        for (DataPointGroupingContext.DataPointGroup group : groups) {
-            for (int i = 0; i < group.dataPoints().size(); i++) {
-                if (group.dataPoints().get(i).supportsColumnarValue() == false) {
-                    return false;
-                }
-            }
-            if (MetricColumnarBuilder.hasNonScalarAttributes(group.dataPointAttributes())) {
-                return false;
-            }
-            if (MetricColumnarBuilder.hasNonScalarAttributes(group.resource().getAttributesList())) {
-                return false;
-            }
-            if (MetricColumnarBuilder.hasNonScalarAttributes(group.scope().getAttributesList())) {
-                return false;
-            }
-            // OTel attribute lists allow duplicate keys; EscfRowBuffer rejects them. Detect here to
-            // avoid a mid-batch IllegalArgumentException that would propagate as a 500.
-            if (hasDuplicateAttributeKeys(group.dataPointAttributes())
-                || hasDuplicateAttributeKeys(group.resource().getAttributesList())
-                || hasDuplicateAttributeKeys(group.scope().getAttributesList())) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static boolean hasDuplicateAttributeKeys(List<KeyValue> attributes) {
-        if (attributes.size() <= 1) {
-            return false;
-        }
-        Set<String> seen = new HashSet<>(attributes.size());
-        for (int i = 0; i < attributes.size(); i++) {
-            if (seen.add(attributes.get(i).getKey()) == false) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private void addEscfBatch(
+    // visible for testing
+    boolean tryAddEscfBatch(
         BulkRequestBuilder bulkRequestBuilder,
         MetricColumnarBuilder metricColumnarBuilder,
         List<DataPointGroupingContext.DataPointGroup> groups,
@@ -279,12 +240,10 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
                 var dynamicTemplates = Maps.<String, String>newHashMapWithExpectedSize(group.dataPoints().size());
                 var dynamicTemplateParams = Maps.<String, Map<String, String>>newHashMapWithExpectedSize(group.dataPoints().size());
 
-                boolean ok = metricColumnarBuilder.buildMetricRow(batchBuilder, group, dynamicTemplates, dynamicTemplateParams);
-                if (ok == false) {
-                    // Eligibility pre-check should have prevented this; fail loudly.
-                    throw new IllegalStateException(
-                        "ESCF pre-flight check passed but buildMetricRow returned false for target [" + target + "]"
-                    );
+                if (metricColumnarBuilder.buildMetricRow(batchBuilder, group, dynamicTemplates, dynamicTemplateParams) == false) {
+                    // Unsupported content: back out. Nothing has been added to the bulk request yet and closing
+                    // the builder releases the uncommitted partition.
+                    return false;
                 }
                 int rowIndex = batchBuilder.commit(0);
 
@@ -299,7 +258,6 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
                     .setTimeSeriesTimestamp(tsTimestamp);
                 // Source row will be attached after buildPartition below.
                 rowRequests.put(rowIndex, indexRequest);
-                bulkRequestBuilder.add(indexRequest);
             }
 
             // Partition 0 is the only partition: EscfBatchBuilder supports multiple keyed partitions
@@ -323,9 +281,11 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
                 );
             }
 
-            // Attach source rows now that the batch object is stable.
+            // Attach source rows now that the batch object is stable, and only now hand the requests to the bulk
+            // request: every row has been committed, so there is no fallback to doc-mode past this point.
             for (Map.Entry<Integer, IndexRequest> e : rowRequests.entrySet()) {
                 e.getValue().indexSource().setSourceRow(batch, e.getKey(), XContentType.JSON);
+                bulkRequestBuilder.add(e.getValue());
             }
 
             // Register the pre-built batch. BatchModeRouter will scatter it to shards and invoke
@@ -336,6 +296,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
             // below does NOT close or invalidate the batch; ownership passes to the bulk action, which releases
             // it, and AbstractOTLPTransportAction releases it if the bulk is rejected before the action takes it.
             bulkRequestBuilder.setPreBuiltBatches(Map.of(target, batch));
+            return true;
         }
     }
 
@@ -401,9 +362,6 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
         String dataStreamName,
         List<DataPointGroupingContext.DataPointGroup> allGroups
     ) {
-        if (batchIndexingEnabled.isEnabled() == false) {
-            return false;
-        }
         DataStream dataStream = projectMetadata.dataStreams().get(dataStreamName);
         if (dataStream == null) {
             DataStreamAlias alias = projectMetadata.dataStreamAliases().get(dataStreamName);

@@ -9,7 +9,9 @@ package org.elasticsearch.xpack.oteldata.otlp;
 
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest;
 import io.opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse;
+import io.opentelemetry.proto.metrics.v1.AggregationTemporality;
 import io.opentelemetry.proto.metrics.v1.Exemplar;
+import io.opentelemetry.proto.metrics.v1.HistogramDataPoint;
 import io.opentelemetry.proto.metrics.v1.Metric;
 
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -35,6 +37,7 @@ import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
+import org.elasticsearch.core.Releasable;
 import org.elasticsearch.http.HttpTransportSettings;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexMode;
@@ -47,9 +50,11 @@ import org.elasticsearch.xpack.core.XPackSettings;
 import org.elasticsearch.xpack.oteldata.OTelPlugin;
 import org.elasticsearch.xpack.oteldata.otlp.datapoint.DataPointGroupingContext;
 import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MappingHints;
+import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MetricColumnarBuilder;
 import org.elasticsearch.xpack.oteldata.otlp.proto.BufferedByteStringAccessor;
 import org.mockito.ArgumentCaptor;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -415,7 +420,8 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
         List<DataPointGroupingContext.DataPointGroup> groups = collectGroups(
             ExportMetricsServiceRequest.parseFrom(createMetricsRequest(createMetric()).getRequest().streamInput())
         );
-        assertTrue(metricsAction.canUseBatchIndexing(true, projectMetadata, groups));
+        assertTrue(metricsAction.canAttemptBatchIndexing(projectMetadata, groups));
+        assertEscfAttempt(groups, true, true);
 
         Exemplar exemplar = OtlpUtils.createLongExemplar(1_000_000L, 42L);
         Metric metricWithExemplar = OtlpUtils.createGaugeMetric(
@@ -427,7 +433,11 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             ExportMetricsServiceRequest.parseFrom(createMetricsRequest(metricWithExemplar).getRequest().streamInput())
         );
 
-        assertFalse(metricsAction.canUseBatchIndexing(true, projectMetadata, groupsWithExemplars));
+        // The metadata gate does not look at the payload; the exemplar is only discovered while writing the batch,
+        // and only matters when exemplar ingestion is enabled.
+        assertTrue(metricsAction.canAttemptBatchIndexing(projectMetadata, groupsWithExemplars));
+        assertEscfAttempt(groupsWithExemplars, true, false);
+        assertEscfAttempt(groupsWithExemplars, false, true);
     }
 
     public void testAttributeFanoutReturns413() {
@@ -470,11 +480,10 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
     }
 
     /**
-     * A data-point group whose resource carries an ARRAY attribute must be rejected by
-     * {@link OTLPMetricsTransportAction#isEscfEligible} so the transport action falls back to doc-mode.
-     * This test exercises the transport-action gate directly (not just {@code buildMetricRow}).
+     * A data-point group whose resource carries an ARRAY attribute must make the optimistic ESCF attempt back out
+     * so the transport action falls back to doc-mode, leaving nothing behind in the bulk request.
      */
-    public void testIsEscfEligibleFalseForArrayResourceAttribute() throws Exception {
+    public void testEscfAttemptBacksOutForArrayResourceAttribute() throws Exception {
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
             .addResourceMetrics(
                 OtlpUtils.createResourceMetrics(
@@ -490,16 +499,14 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             )
             .build();
 
-        List<DataPointGroupingContext.DataPointGroup> groups = collectGroups(request);
-        assertFalse("array resource attribute must make group ineligible", OTLPMetricsTransportAction.isEscfEligible(groups));
+        assertEscfAttempt(collectGroups(request), false, false);
     }
 
     /**
-     * A data-point group whose attribute list contains a duplicate key must be rejected by
-     * {@link OTLPMetricsTransportAction#isEscfEligible}. Without this check, the duplicate would
-     * reach {@code EscfRowBuffer} as an {@code IllegalArgumentException} and surface as a 500.
+     * A data-point group whose attribute list contains a duplicate key is rejected by {@code EscfRowBuffer} with an
+     * {@code IllegalArgumentException}; the ESCF attempt must turn that into a clean fallback instead of a 500.
      */
-    public void testIsEscfEligibleFalseForDuplicateDataPointAttributeKey() throws Exception {
+    public void testEscfAttemptBacksOutForDuplicateDataPointAttributeKey() throws Exception {
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
             .addResourceMetrics(
                 OtlpUtils.createResourceMetrics(
@@ -527,12 +534,45 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             )
             .build();
 
-        List<DataPointGroupingContext.DataPointGroup> groups = collectGroups(request);
-        assertFalse("duplicate data-point attribute key must make group ineligible", OTLPMetricsTransportAction.isEscfEligible(groups));
+        assertEscfAttempt(collectGroups(request), false, false);
     }
 
-    /** Scalar-only groups with unique keys must remain eligible. */
-    public void testIsEscfEligibleTrueForScalarAttributes() throws Exception {
+    /**
+     * When only a later group is unsupported, the rows already committed for the earlier groups must be rolled
+     * back as well: the bulk request ends up with no index requests and no pre-built batch.
+     */
+    public void testEscfAttemptBacksOutAfterPartialProgress() throws Exception {
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                OtlpUtils.createResourceMetrics(
+                    List.of(keyValue("service.name", "svc")),
+                    List.of(
+                        OtlpUtils.createScopeMetrics(
+                            "s",
+                            "1",
+                            List.of(
+                                OtlpUtils.createGaugeMetric("cpu", "1", List.of(OtlpUtils.createDoubleDataPoint(0))),
+                                OtlpUtils.createGaugeMetric("mem", "1", List.of(OtlpUtils.createDoubleDataPoint(1_000_000L))),
+                                OtlpUtils.createHistogramMetric(
+                                    "latency",
+                                    "ms",
+                                    List.of(HistogramDataPoint.newBuilder().setTimeUnixNano(2_000_000L).setCount(1).setSum(1.0).build()),
+                                    AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+            .build();
+
+        List<DataPointGroupingContext.DataPointGroup> groups = collectGroups(request);
+        assertThat("distinct timestamps must produce one group each", groups.size(), equalTo(3));
+        assertEscfAttempt(groups, false, false);
+    }
+
+    /** Scalar-only groups with unique keys go through the ESCF path. */
+    public void testEscfAttemptSucceedsForScalarAttributes() throws Exception {
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
             .addResourceMetrics(
                 OtlpUtils.createResourceMetrics(
@@ -554,8 +594,42 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             )
             .build();
 
-        List<DataPointGroupingContext.DataPointGroup> groups = collectGroups(request);
-        assertTrue("scalar unique-key group must be eligible", OTLPMetricsTransportAction.isEscfEligible(groups));
+        assertEscfAttempt(collectGroups(request), false, true);
+    }
+
+    /**
+     * Runs {@link OTLPMetricsTransportAction#tryAddEscfBatch} on a fresh bulk request and asserts the outcome: on
+     * success the bulk request holds one index request per group plus the pre-built batch for the target; on
+     * fallback it must be left completely untouched.
+     */
+    private void assertEscfAttempt(
+        List<DataPointGroupingContext.DataPointGroup> groups,
+        boolean exemplarIngestionEnabled,
+        boolean expectedSuccess
+    ) throws IOException {
+        String target = groups.getFirst().targetIndex().index();
+        BulkRequestBuilder bulkRequestBuilder = new BulkRequestBuilder(client);
+        MetricColumnarBuilder columnarBuilder = new MetricColumnarBuilder(
+            MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM,
+            exemplarIngestionEnabled
+        );
+        boolean success = metricsAction.tryAddEscfBatch(bulkRequestBuilder, columnarBuilder, groups, target);
+        assertThat(success, equalTo(expectedSuccess));
+        BulkRequest bulkRequest = bulkRequestBuilder.request();
+        try {
+            if (expectedSuccess) {
+                assertThat(bulkRequest.numberOfActions(), equalTo(groups.size()));
+                assertNotNull("pre-built batch must be registered", bulkRequest.getPreBuiltBatches());
+                assertThat(bulkRequest.getPreBuiltBatches().keySet(), equalTo(Set.of(target)));
+            } else {
+                assertThat("fallback must not leave index requests behind", bulkRequest.numberOfActions(), equalTo(0));
+                assertNull("fallback must not leave a pre-built batch behind", bulkRequest.getPreBuiltBatches());
+            }
+        } finally {
+            if (bulkRequest.getPreBuiltBatches() != null) {
+                bulkRequest.getPreBuiltBatches().values().forEach(Releasable::close);
+            }
+        }
     }
 
     private static List<DataPointGroupingContext.DataPointGroup> collectGroups(ExportMetricsServiceRequest request) throws Exception {

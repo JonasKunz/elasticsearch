@@ -25,6 +25,7 @@ import org.elasticsearch.xpack.oteldata.otlp.datapoint.DataPointGroupingContext;
 import org.elasticsearch.xpack.oteldata.otlp.proto.BufferedByteStringAccessor;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -34,6 +35,7 @@ import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createDoubleDataPo
 import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createGaugeMetric;
 import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createHistogramMetric;
 import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createLongDataPoint;
+import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createLongExemplar;
 import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createResourceMetrics;
 import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createScopeMetrics;
 import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createSumMetric;
@@ -41,7 +43,7 @@ import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.keyValue;
 
 public class MetricColumnarBuilderTests extends ESTestCase {
 
-    private final MetricColumnarBuilder builder = new MetricColumnarBuilder(MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM);
+    private final MetricColumnarBuilder builder = new MetricColumnarBuilder(MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM, false);
     private final long nowNanos = System.currentTimeMillis() * 1_000_000L;
 
     // -------------------------------------------------------------------------
@@ -318,5 +320,121 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
         context.consume(group -> { assertFalse(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>())); });
         assertFalse(batchBuilder.hasPartition(0));
+    }
+
+    /**
+     * OTel attribute lists may contain duplicate keys, which {@code EscfRowBuffer} rejects. There is no up-front
+     * scan for this; the resulting exception must be turned into a {@code false} return while writing.
+     */
+    public void testBuildMetricRowReturnsFalseForDuplicateAttributeKey() throws Exception {
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                createResourceMetrics(
+                    List.of(keyValue("service.name", "svc"), keyValue("service.name", "other")),
+                    List.of(createScopeMetrics("s", "1", List.of(createGaugeMetric("cpu", "1", List.of(createDoubleDataPoint(nowNanos))))))
+                )
+            )
+            .build();
+
+        DataPointGroupingContext context = newContext();
+        context.groupDataPoints(request);
+
+        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        context.consume(group -> { assertFalse(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>())); });
+        assertFalse(batchBuilder.hasPartition(0));
+    }
+
+    /**
+     * A data point carrying exemplars can only be written columnar when exemplar ingestion is disabled, because
+     * exemplar documents are produced by the XContent path only.
+     */
+    public void testBuildMetricRowRejectsExemplarsOnlyWhenExemplarIngestionEnabled() throws Exception {
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                createResourceMetrics(
+                    List.of(keyValue("service.name", "svc")),
+                    List.of(
+                        createScopeMetrics(
+                            "s",
+                            "1",
+                            List.of(
+                                createGaugeMetric(
+                                    "cpu",
+                                    "1",
+                                    List.of(createDoubleDataPoint(nowNanos, 0, List.of(), List.of(createLongExemplar(nowNanos, 42L))))
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+            .build();
+
+        DataPointGroupingContext context = newContext();
+        context.groupDataPoints(request);
+        List<DataPointGroupingContext.DataPointGroup> groups = new ArrayList<>();
+        context.consume(groups::add);
+        assertEquals(1, groups.size());
+
+        EscfBatchBuilder rejecting = new EscfBatchBuilder();
+        MetricColumnarBuilder withExemplarIngestion = new MetricColumnarBuilder(MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM, true);
+        assertFalse(withExemplarIngestion.buildMetricRow(rejecting, groups.getFirst(), new HashMap<>(), new HashMap<>()));
+        assertFalse(rejecting.hasPartition(0));
+
+        EscfBatchBuilder accepting = new EscfBatchBuilder();
+        assertTrue(builder.buildMetricRow(accepting, groups.getFirst(), new HashMap<>(), new HashMap<>()));
+        accepting.commit(0);
+        assertEquals(1, accepting.buildPartition(0).docCount());
+    }
+
+    /**
+     * After a row fails part-way, the same builder must still be able to write a following row correctly: the
+     * half-written row is discarded by the next {@code beginRow()} and must not leak values into the next one.
+     */
+    public void testFailedRowDoesNotCorruptNextRow() throws Exception {
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                createResourceMetrics(
+                    List.of(keyValue("service.name", "bad"), keyValue("tags", "a", "b")),
+                    List.of(createScopeMetrics("s", "1", List.of(createGaugeMetric("cpu", "1", List.of(createDoubleDataPoint(nowNanos))))))
+                )
+            )
+            .addResourceMetrics(
+                createResourceMetrics(
+                    List.of(keyValue("service.name", "good")),
+                    List.of(
+                        createScopeMetrics(
+                            "s",
+                            "1",
+                            List.of(createGaugeMetric("cpu", "1", List.of(createDoubleDataPoint(nowNanos + 1_000_000L))))
+                        )
+                    )
+                )
+            )
+            .build();
+
+        DataPointGroupingContext context = newContext();
+        context.groupDataPoints(request);
+        // Group iteration order is not defined; make sure the failing ("bad") group is written first.
+        List<DataPointGroupingContext.DataPointGroup> groups = new ArrayList<>();
+        context.consume(groups::add);
+        assertEquals(2, groups.size());
+        groups.sort(Comparator.comparing(group -> group.resource().getAttributes(0).getValue().getStringValue()));
+
+        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        List<Boolean> results = new ArrayList<>();
+        for (DataPointGroupingContext.DataPointGroup group : groups) {
+            boolean ok = builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>());
+            results.add(ok);
+            if (ok) {
+                batchBuilder.commit(0);
+            }
+        }
+        assertEquals(List.of(false, true), results);
+
+        EscfBatch batch = batchBuilder.buildPartition(0);
+        assertEquals(1, batch.docCount());
+        assertEquals(List.of("good"), readStringColumn(batch, "resource.attributes.service.name"));
+        assertTrue("column from the failed row must have no values", readStringColumn(batch, "resource.attributes.tags").isEmpty());
     }
 }
