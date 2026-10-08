@@ -113,7 +113,10 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
     private final DataStreamFailureStoreSettings dataStreamFailureStoreSettings;
     private final boolean clusterHasFailureStoreFeature;
     @Nullable
-    private final BatchModeRouter router;
+    private final boolean batchIndexingSupported;
+    private final Recycler<BytesRef> recycler;
+    @Nullable
+    private BatchRouterSet router;
 
     BulkOperation(
         Task task,
@@ -198,11 +201,9 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
         this.failureStoreMetrics = failureStoreMetrics;
         this.dataStreamFailureStoreSettings = dataStreamFailureStoreSettings;
         this.clusterHasFailureStoreFeature = clusterHasFailureStoreFeature;
-        this.router = BatchModeRouter.create(
-            bulkRequest,
-            ShardBatchIndexer.isBatchIndexingSupported(batchIndexingEnabled, clusterService),
-            recycler
-        );
+        this.batchIndexingSupported = ShardBatchIndexer.isBatchIndexingSupported(batchIndexingEnabled, clusterService);
+        this.recycler = recycler;
+        this.router = BatchRouterSet.create(bulkRequest, batchIndexingSupported, recycler);
     }
 
     @Override
@@ -234,8 +235,8 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
         }
         // Build per-shard source batches. For the inline-encoder path, batches are finalized here
         // (rows were accumulated during routing). For provided-batch mode the source is scattered here.
-        try (router) {
-            return router.shardBatches();
+        try (BatchRouterSet routers = router) {
+            return routers.shardBatches();
         }
     }
 
@@ -318,6 +319,16 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
     }
 
     private Map<ShardId, List<BulkItemRequest>> groupBulkRequestsByShards(ClusterState clusterState) {
+        // If no pre-built batches were supplied, try to encode the x-content items into ESCF now,
+        // before the routing pass, so the columnar routing path can be used.
+        if (router == null && batchIndexingSupported) {
+            router = BulkBatchEncoders.encode(
+                bulkRequest,
+                projectResolver.getProjectMetadata(clusterState),
+                indexNameExpressionResolver,
+                recycler
+            );
+        }
         return groupRequestsByShards(
             clusterState,
             Iterators.enumerate(bulkRequest.requests.iterator(), BulkItemRequest::new),
@@ -339,12 +350,12 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
         ClusterState clusterState,
         Iterator<BulkItemRequest> it,
         BiConsumer<IndexAbstraction, DocWriteRequest<?>> indexOperationValidator,
-        @Nullable BatchModeRouter batchRouter
+        @Nullable BatchRouterSet batchRouter
     ) {
         ProjectMetadata project = projectResolver.getProjectMetadata(clusterState);
         final ConcreteIndices concreteIndices = new ConcreteIndices(project, indexNameExpressionResolver);
-        // Both modes fill the same map: x-content fills it incrementally in route(); provided-batch
-        // fills it in buildGrouping() after the deferred columnar routing pass completes.
+        // Both modes fill the same map: the batch path defers it to buildGrouping() after the
+        // columnar routing pass; the row path fills it incrementally in the per-item loop below.
         Map<ShardId, List<BulkItemRequest>> requestsByShard = new HashMap<>();
 
         // For provided-batch TSDB data streams: resolve @timestamp from the ESCF columns and cache it
@@ -462,7 +473,7 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
 
         Map<ShardId, SourceBatch> undispatchedBatches = new HashMap<>(shardBatches);
         try {
-            BatchModeRouter.validateBatchAlignment(requestsByShard, shardBatches);
+            BatchRouterSet.validateBatchAlignment(requestsByShard, shardBatches);
 
             String nodeId = clusterService.localNode().getId();
             ProjectMetadata project = projectResolver.getProjectMetadata(clusterState);
@@ -930,7 +941,7 @@ final class BulkOperation extends ActionRunnable<BulkResponse> {
     }
 
     /**
-     * Per-item failure handler passed to {@link BatchModeRouter#buildGrouping} for the columnar routing
+     * Per-item failure handler passed to {@link BatchRouterSet#buildGrouping} for the columnar routing
      * path. Mirrors the {@code catch (IllegalArgumentException | ...)} block in
      * {@link #groupRequestsByShards}: marks the item failed and discards it from the working request
      * list. All items in the deferred batch receive the same exception because the columnar routing

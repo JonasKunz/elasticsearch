@@ -116,9 +116,9 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             Map<String, String> templates = new HashMap<>();
             Map<String, Map<String, String>> templateParams = new HashMap<>();
             assertTrue(builder.buildMetricRow(batchBuilder, group, templates, templateParams));
-            batchBuilder.commit(0);
+            batchBuilder.finishRow();
         });
-        EscfBatch batch = batchBuilder.buildPartition(0);
+        EscfBatch batch = batchBuilder.build();
 
         assertEquals(1, batch.docCount());
         assertFalse(readLongColumn(batch, "@timestamp").isEmpty());
@@ -157,9 +157,9 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
         context.consume(group -> {
             assertTrue(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>()));
-            batchBuilder.commit(0);
+            batchBuilder.finishRow();
         });
-        EscfBatch batch = batchBuilder.buildPartition(0);
+        EscfBatch batch = batchBuilder.build();
 
         assertEquals(2, batch.docCount());
         List<String> names = readStringColumn(batch, "resource.attributes.service.name");
@@ -209,9 +209,9 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
         context.consume(group -> {
             assertTrue(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>()));
-            batchBuilder.commit(0);
+            batchBuilder.finishRow();
         });
-        EscfBatch batch = batchBuilder.buildPartition(0);
+        EscfBatch batch = batchBuilder.build();
 
         assertEquals(1, batch.docCount());
         assertEquals(List.of("prod"), readStringColumn(batch, "attributes.env"));
@@ -254,7 +254,8 @@ public class MetricColumnarBuilderTests extends ESTestCase {
 
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
         context.consume(group -> { assertFalse(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>())); });
-        assertFalse(batchBuilder.hasPartition(0));
+        // The failed row is aborted, not rolled back: it still occupies a row in the (to be discarded) batch.
+        assertEquals(1, batchBuilder.docCount());
     }
 
     /** Dotted metric names (e.g. {@code gauge.0}) are written as a nested-path column, not a top-level key. */
@@ -276,9 +277,9 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
         context.consume(group -> {
             assertTrue(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>()));
-            batchBuilder.commit(0);
+            batchBuilder.finishRow();
         });
-        EscfBatch batch = batchBuilder.buildPartition(0);
+        EscfBatch batch = batchBuilder.build();
 
         assertEquals(1, batch.docCount());
         // The dotted metric name "gauge.0" must produce a column at path "metrics.gauge.0".
@@ -319,11 +320,12 @@ public class MetricColumnarBuilderTests extends ESTestCase {
 
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
         context.consume(group -> { assertFalse(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>())); });
-        assertFalse(batchBuilder.hasPartition(0));
+        // The failed row is aborted, not rolled back: it still occupies a row in the (to be discarded) batch.
+        assertEquals(1, batchBuilder.docCount());
     }
 
     /**
-     * OTel attribute lists may contain duplicate keys, which {@code EscfRowBuffer} rejects. There is no up-front
+     * OTel attribute lists may contain duplicate keys, which {@code EscfBatchBuilder} rejects. There is no up-front
      * scan for this; the resulting exception must be turned into a {@code false} return while writing.
      */
     public void testBuildMetricRowReturnsFalseForDuplicateAttributeKey() throws Exception {
@@ -341,7 +343,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
 
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
         context.consume(group -> { assertFalse(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>())); });
-        assertFalse(batchBuilder.hasPartition(0));
+        assertEquals(1, batchBuilder.docCount());
     }
 
     /**
@@ -379,17 +381,17 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         EscfBatchBuilder rejecting = new EscfBatchBuilder();
         MetricColumnarBuilder withExemplarIngestion = new MetricColumnarBuilder(MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM, true);
         assertFalse(withExemplarIngestion.buildMetricRow(rejecting, groups.getFirst(), new HashMap<>(), new HashMap<>()));
-        assertFalse(rejecting.hasPartition(0));
+        assertEquals(1, rejecting.docCount());
 
         EscfBatchBuilder accepting = new EscfBatchBuilder();
         assertTrue(builder.buildMetricRow(accepting, groups.getFirst(), new HashMap<>(), new HashMap<>()));
-        accepting.commit(0);
-        assertEquals(1, accepting.buildPartition(0).docCount());
+        assertEquals(0, accepting.finishRow());
+        assertEquals(1, accepting.build().docCount());
     }
 
     /**
      * After a row fails part-way, the same builder must still be able to write a following row correctly: the
-     * half-written row is discarded by the next {@code beginRow()} and must not leak values into the next one.
+     * half-written row is aborted (absent-filled) and must not leak values into the next one.
      */
     public void testFailedRowDoesNotCorruptNextRow() throws Exception {
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
@@ -422,19 +424,13 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         groups.sort(Comparator.comparing(group -> group.resource().getAttributes(0).getValue().getStringValue()));
 
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
-        List<Boolean> results = new ArrayList<>();
-        for (DataPointGroupingContext.DataPointGroup group : groups) {
-            boolean ok = builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>());
-            results.add(ok);
-            if (ok) {
-                batchBuilder.commit(0);
-            }
-        }
-        assertEquals(List.of(false, true), results);
+        assertFalse(builder.buildMetricRow(batchBuilder, groups.get(0), new HashMap<>(), new HashMap<>()));
+        assertTrue(builder.buildMetricRow(batchBuilder, groups.get(1), new HashMap<>(), new HashMap<>()));
+        assertEquals("the aborted row keeps its row index", 1, batchBuilder.finishRow());
 
-        EscfBatch batch = batchBuilder.buildPartition(0);
-        assertEquals(1, batch.docCount());
-        assertEquals(List.of("good"), readStringColumn(batch, "resource.attributes.service.name"));
+        EscfBatch batch = batchBuilder.build();
+        assertEquals(2, batch.docCount());
+        assertEquals(List.of("bad", "good"), readStringColumn(batch, "resource.attributes.service.name"));
         assertTrue("column from the failed row must have no values", readStringColumn(batch, "resource.attributes.tags").isEmpty());
     }
 }

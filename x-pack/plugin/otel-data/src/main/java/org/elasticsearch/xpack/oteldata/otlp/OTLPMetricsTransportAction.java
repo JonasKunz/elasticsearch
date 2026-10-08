@@ -233,7 +233,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
         List<DataPointGroupingContext.DataPointGroup> groups,
         String target
     ) throws IOException {
-        // Collect (rowIndex -> IndexRequest) during the build pass, then attach source rows after buildPartition.
+        // Collect (rowIndex -> IndexRequest) during the build pass, then attach source rows after build().
         Map<Integer, IndexRequest> rowRequests = new LinkedHashMap<>(groups.size());
         try (EscfBatchBuilder batchBuilder = new EscfBatchBuilder(bytesRefRecycler)) {
             for (DataPointGroupingContext.DataPointGroup group : groups) {
@@ -242,10 +242,10 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
 
                 if (metricColumnarBuilder.buildMetricRow(batchBuilder, group, dynamicTemplates, dynamicTemplateParams) == false) {
                     // Unsupported content: back out. Nothing has been added to the bulk request yet and closing
-                    // the builder releases the uncommitted partition.
+                    // the builder releases the partially written column buffers.
                     return false;
                 }
-                int rowIndex = batchBuilder.commit(0);
+                int rowIndex = batchBuilder.finishRow();
 
                 Instant tsTimestamp = DataStream.getCanonicalTimestampBound(
                     Instant.ofEpochMilli(TimeUnit.NANOSECONDS.toMillis(group.getTimestampUnixNano()))
@@ -256,14 +256,12 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
                     .setDynamicTemplates(dynamicTemplates)
                     .setDynamicTemplateParams(dynamicTemplateParams)
                     .setTimeSeriesTimestamp(tsTimestamp);
-                // Source row will be attached after buildPartition below.
+                // Source row will be attached after build() below.
                 rowRequests.put(rowIndex, indexRequest);
             }
 
-            // Partition 0 is the only partition: EscfBatchBuilder supports multiple keyed partitions
-            // for producers that pre-split rows by shard, but we keep all rows in one flat batch and
-            // let BatchModeRouter / EscfBatchScatterer handle shard scatter downstream.
-            EscfBatch batch = batchBuilder.buildPartition(0);
+            // All rows are kept in one flat batch; BatchModeRouter / EscfBatchScatterer handle shard scatter downstream.
+            EscfBatch batch = batchBuilder.build();
 
             // Guard against coordinator heap exhaustion on large fan-out OTLP exports (resource/scope
             // attributes copied into every row mean the batch can be significantly larger than the

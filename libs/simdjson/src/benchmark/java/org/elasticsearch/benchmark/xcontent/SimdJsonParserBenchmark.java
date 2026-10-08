@@ -21,7 +21,6 @@ import org.elasticsearch.escf.EscfBatch;
 import org.elasticsearch.escf.EscfEncoder;
 import org.elasticsearch.simdjson.SimdJsonParserPool;
 import org.elasticsearch.simdjson.SimdJsonSupport;
-import org.elasticsearch.sourcebatch.LeafSink;
 import org.elasticsearch.transport.BytesRefRecycler;
 import org.elasticsearch.xcontent.XContentType;
 import org.openjdk.jmh.annotations.Benchmark;
@@ -64,17 +63,17 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * <p>One invocation stands in for one bulk request against one concrete index, so that the costs
  * that are paid per bulk rather than per document land inside the measured region:
  * <ul>
- *   <li>{@code mappingCount} fresh {@link EscfEncoder}s are constructed per invocation and closed
- *       at the end, matching {@code BulkBatchEncoders}, which creates one encoder per concrete
- *       index in a bulk and closes it once the shard requests are dispatched. Each encoder resolves
- *       its thread's parser from {@link SimdJsonParserPool} at construction and publishes learned
- *       field names on close, so both of those per-bulk costs are measured.</li>
+ *   <li>A fresh {@link EscfEncoder} is constructed per invocation and closed at the end, matching
+ *       the encode pass, which creates one encoder per index-abstraction key in a bulk and closes
+ *       it once the shard requests are dispatched. The encoder resolves its thread's parser from
+ *       {@link SimdJsonParserPool} at construction and publishes learned field names on close, so
+ *       both of those per-bulk costs are measured.</li>
  *   <li>{@code docCount} spans realistic bulk sizes. The small values are the interesting ones for
  *       per-bulk overhead: at 10k documents the per-encoder work is amortized to invisibility,
  *       which is not representative of a typical bulk.</li>
- *   <li>Rows are committed round-robin across {@code shardCount} partitions and each is built
- *       separately, matching {@code BulkBatchEncoders.finalizeBatches}, which calls
- *       {@code buildPartition} once per destination shard on the same encoder.</li>
+ *   <li>All rows are encoded into a single batch via {@link EscfEncoder#addDocument} and the
+ *       batch is built once via {@link EscfEncoder#build()}, matching the encode-then-scatter
+ *       design where shard fanout happens after encoding completes.</li>
  * </ul>
  *
  * <p>Not covered: sources are all zero-offset {@code BytesArray}, whereas bulk items are usually
@@ -121,13 +120,6 @@ public class SimdJsonParserBenchmark {
 
     @Param({ "42" })
     private long seed;
-
-    /**
-     * Destination shards for the index, i.e. how many partitions the encoder fans rows out to and
-     * how many times {@code buildPartition} is called per bulk.
-     */
-    @Param({ "5" })
-    private int shardCount;
 
     /**
      * Concrete indices the bulk fans out to, each with its own encoder and its own field name set.
@@ -177,12 +169,10 @@ public class SimdJsonParserBenchmark {
     private void printSetupSummary(int minLen, long avgLen, int maxLen) {
         System.out.printf(
             Locale.ROOT,
-            "[setup] thread=%s shape=%s docCount=%d shardCount=%d mappingCount=%d docSize min=%d avg=%d max=%d "
-                + "nativeStage1=%s maxSimdDocBytes=%d%n",
+            "[setup] thread=%s shape=%s docCount=%d mappingCount=%d docSize min=%d avg=%d max=%d nativeStage1=%s maxSimdDocBytes=%d%n",
             Thread.currentThread().getName(),
             shape,
             docCount,
-            shardCount,
             mappingCount,
             minLen,
             avgLen,
@@ -203,9 +193,9 @@ public class SimdJsonParserBenchmark {
     }
 
     /**
-     * Encodes one bulk, mirroring {@code BulkBatchEncoders}: one encoder per concrete index, rows
-     * routed to that index's shard partitions, then every partition built during
-     * {@code finalizeBatches}, and finally every encoder closed.
+     * Encodes one bulk, mirroring {@code BulkBatchEncoders}: one encoder per concrete index, every
+     * document added to its index's encoder, one batch built per encoder before it is handed to the
+     * router for shard fanout, and finally every encoder closed.
      */
     private int encodeBulk(boolean allowSimd) throws IOException {
         EscfEncoder[] encoders = new EscfEncoder[mappingCount];
@@ -213,23 +203,13 @@ public class SimdJsonParserBenchmark {
             for (int m = 0; m < mappingCount; m++) {
                 encoders[m] = new EscfEncoder(RECYCLER, allowSimd);
             }
-
             for (int i = 0; i < docs.length; i++) {
-                EscfEncoder encoder = encoders[i % mappingCount];
-                encoder.parseToScratch(docs[i], XContentType.JSON, LeafSink.NO_OP);
-                encoder.commitScratchTo(i % shardCount);
+                encoders[i % mappingCount].addDocument(docs[i], XContentType.JSON);
             }
-
             int leafCount = 0;
             for (EscfEncoder encoder : encoders) {
-                for (int partition = 0; partition < shardCount; partition++) {
-                    // A shard that received no rows is skipped, matching finalizeBatches iterating
-                    // only over shards with pending attachments.
-                    if (encoder.hasPartition(partition)) {
-                        try (EscfBatch batch = encoder.buildPartition(partition)) {
-                            leafCount += batch.schema().leafCount();
-                        }
-                    }
+                try (EscfBatch batch = encoder.build()) {
+                    leafCount += batch.schema().leafCount();
                 }
             }
             return leafCount;

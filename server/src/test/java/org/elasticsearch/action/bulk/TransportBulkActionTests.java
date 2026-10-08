@@ -696,6 +696,9 @@ public class TransportBulkActionTests extends ESTestCase {
     }
 
     public void testPreBuiltBatchReleasedWhenRouterRejects() {
+        // Batch indexing is on by default on this branch; turn it off so the router rejects the pre-built batch.
+        clusterService.getClusterSettings()
+            .applySettings(Settings.builder().put(BatchIndexingEnabled.BATCH_INDEXING.getKey(), false).build());
         BulkRequestTests.CloseCountingBatch batch = new BulkRequestTests.CloseCountingBatch();
         BulkRequest bulkRequest = preBuiltBatchBulkRequest(batch, null);
 

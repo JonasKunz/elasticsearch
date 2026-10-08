@@ -37,7 +37,6 @@ import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
-import org.elasticsearch.core.Releasable;
 import org.elasticsearch.http.HttpTransportSettings;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexMode;
@@ -503,7 +502,7 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
     }
 
     /**
-     * A data-point group whose attribute list contains a duplicate key is rejected by {@code EscfRowBuffer} with an
+     * A data-point group whose attribute list contains a duplicate key is rejected by {@code EscfBatchBuilder} with an
      * {@code IllegalArgumentException}; the ESCF attempt must turn that into a clean fallback instead of a 500.
      */
     public void testEscfAttemptBacksOutForDuplicateDataPointAttributeKey() throws Exception {
@@ -619,16 +618,13 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
         try {
             if (expectedSuccess) {
                 assertThat(bulkRequest.numberOfActions(), equalTo(groups.size()));
-                assertNotNull("pre-built batch must be registered", bulkRequest.getPreBuiltBatches());
-                assertThat(bulkRequest.getPreBuiltBatches().keySet(), equalTo(Set.of(target)));
+                assertTrue("pre-built batch must be registered", bulkRequest.hasPreBuiltBatches());
             } else {
                 assertThat("fallback must not leave index requests behind", bulkRequest.numberOfActions(), equalTo(0));
-                assertNull("fallback must not leave a pre-built batch behind", bulkRequest.getPreBuiltBatches());
+                assertFalse("fallback must not leave a pre-built batch behind", bulkRequest.hasPreBuiltBatches());
             }
         } finally {
-            if (bulkRequest.getPreBuiltBatches() != null) {
-                bulkRequest.getPreBuiltBatches().values().forEach(Releasable::close);
-            }
+            bulkRequest.releasePreBuiltBatches();
         }
     }
 
