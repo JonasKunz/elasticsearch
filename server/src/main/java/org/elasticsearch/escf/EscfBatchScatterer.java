@@ -132,7 +132,12 @@ public final class EscfBatchScatterer implements Releasable {
         int partitionCount = destCounts.length;
         for (int p = 0; p < partitionCount; p++) {
             if (destCounts[p] > 0) {
-                EscfColumnBuilder b = new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler);
+                // A dictionary-encoded source stays dictionary-encoded in every partition (each gets its own dictionary).
+                EscfColumnBuilder b = new EscfColumnBuilder(
+                    EscfColumnBuilder.CollisionPolicy.SPLIT,
+                    recycler,
+                    col instanceof EscfDictStringColumn
+                );
                 applyHint(b, col);
                 builders[p] = b;
             }

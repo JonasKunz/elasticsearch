@@ -229,7 +229,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
             return null;
         }
         MetricColumnarBuilder columnarBuilder = new MetricColumnarBuilder(defaultMappingHints, exemplarIngestionEnabled);
-        try (EscfBatchBuilder batchBuilder = new EscfBatchBuilder(bytesRefRecycler)) {
+        try (EscfBatchBuilder batchBuilder = new EscfBatchBuilder(bytesRefRecycler, true)) {
             // Cheap early exit so that streams which can never take the ESCF path do not pay for writing a batch.
             MetricColumnarBuilder.Rows rows = columnarBuilder.buildRows(
                 batchBuilder,

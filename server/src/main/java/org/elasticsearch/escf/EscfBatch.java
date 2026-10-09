@@ -171,8 +171,9 @@ public final class EscfBatch implements SourceBatch {
     /** Raw value bytes of one column: the payload ref length, or the kind-specific equivalent when there is no payload. */
     private static int valueBytes(EscfColumnData col) {
         return switch (col.kind()) {
-            case EscfColumnKind.LONG, EscfColumnKind.DOUBLE, EscfColumnKind.STRING, EscfColumnKind.BINARY, EscfColumnKind.UNION ->
-                (int) refLen(col.data());
+            case EscfColumnKind.LONG, EscfColumnKind.DOUBLE, EscfColumnKind.BINARY, EscfColumnKind.UNION -> (int) refLen(col.data());
+            // a dictionary-encoded STRING stores its dictionary values plus two ordinal bytes per document
+            case EscfColumnKind.STRING -> (int) (refLen(col.data()) + (col.ordinals() != null ? 2L * col.ordinals().length : 0L));
             // BOOL has no byte payload: values are one bit per document
             case EscfColumnKind.BOOL -> EscfBatchCodec.bitsetBytes(col.docCount());
             // ARRAY has no payload of its own: the elements live in the child column
@@ -210,7 +211,9 @@ public final class EscfBatch implements SourceBatch {
     /** Sums a column's own live storage plus, for ARRAY, its nested {@code child} column's storage. */
     private static long columnRamBytes(EscfColumnData col) {
         long total = bitsetRam(col.validity()) + bitsetRam(col.values()) + (col.typeVector() != null ? col.typeVector().length : 0L) + (col
-            .offsets() != null ? col.offsets().length * 4L : 0L) + refLen(col.data());
+            .offsets() != null ? col.offsets().length * 4L : 0L) + refLen(col.data()) + (col.ordinals() != null
+                ? col.ordinals().length * 2L
+                : 0L);
         if (col.child() != null) {
             total += columnRamBytes(col.child());
         }
