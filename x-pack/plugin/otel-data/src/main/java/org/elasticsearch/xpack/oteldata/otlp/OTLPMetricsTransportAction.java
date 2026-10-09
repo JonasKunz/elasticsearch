@@ -35,7 +35,6 @@ import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.Maps;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.escf.EscfBatch;
-import org.elasticsearch.escf.EscfBatchBuilder;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.IndexVersion;
@@ -56,6 +55,7 @@ import org.elasticsearch.xpack.oteldata.otlp.docbuilder.ExemplarDocumentBuilder;
 import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MappingHints;
 import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MetricColumnarBuilder;
 import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MetricDocumentBuilder;
+import org.elasticsearch.xpack.oteldata.otlp.docbuilder.OtlpMetricsBatchBuilder;
 import org.elasticsearch.xpack.oteldata.otlp.proto.BufferedByteStringAccessor;
 
 import java.io.IOException;
@@ -229,7 +229,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
             return null;
         }
         MetricColumnarBuilder columnarBuilder = new MetricColumnarBuilder(defaultMappingHints, exemplarIngestionEnabled);
-        try (EscfBatchBuilder batchBuilder = new EscfBatchBuilder(bytesRefRecycler, true)) {
+        try (OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder(bytesRefRecycler, true)) {
             // Cheap early exit so that streams which can never take the ESCF path do not pay for writing a batch.
             MetricColumnarBuilder.Rows rows = columnarBuilder.buildRows(
                 batchBuilder,
@@ -251,7 +251,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
     @Nullable
     private ProcessingContext finishEscfBatch(
         BulkRequestBuilder bulkRequestBuilder,
-        EscfBatchBuilder batchBuilder,
+        OtlpMetricsBatchBuilder batchBuilder,
         MetricColumnarBuilder.Rows rows,
         ProjectMetadata projectMetadata
     ) throws IOException {
@@ -291,7 +291,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
         // Register the pre-built batch. BatchModeRouter will scatter it to shards and invoke
         // ForIndexDimensions.indexShard(requests, batch), which calls ColumnarTsidCalculator to
         // derive _tsid column-major (no pre-set tsid required on the IndexRequests).
-        // Ownership of the batch transfers to the bulk request here. EscfBatchBuilder.close() only
+        // Ownership of the batch transfers to the bulk request here. OtlpMetricsBatchBuilder.close() only
         // releases unbuilt column buffers, so closing the builder does NOT close or invalidate the batch;
         // ownership passes to the bulk action, which releases it, and AbstractOTLPTransportAction releases it
         // if the bulk is rejected before the action takes it.

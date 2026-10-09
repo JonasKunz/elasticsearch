@@ -495,7 +495,7 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
     }
 
     /**
-     * A data point whose attribute list contains a duplicate key is rejected by {@code EscfBatchBuilder} with an
+     * A data point whose attribute list contains a duplicate key is rejected by {@code OtlpMetricsBatchBuilder} with an
      * {@code IllegalArgumentException}; the ESCF attempt must turn that into a clean fallback instead of a 500.
      */
     public void testEscfAttemptBacksOutForDuplicateDataPointAttributeKey() throws Exception {

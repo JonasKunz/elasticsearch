@@ -18,7 +18,6 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.hash.BufferedMurmur3Hasher;
 import org.elasticsearch.escf.EscfBatch;
-import org.elasticsearch.escf.EscfBatchBuilder;
 import org.elasticsearch.escf.EscfColumnKind;
 import org.elasticsearch.sourcebatch.SourceSchema;
 import org.elasticsearch.test.ESTestCase;
@@ -56,14 +55,14 @@ public class MetricColumnarBuilderTests extends ESTestCase {
      */
     private List<Boolean> writeRows(
         MetricColumnarBuilder columnarBuilder,
-        EscfBatchBuilder batchBuilder,
+        OtlpMetricsBatchBuilder batchBuilder,
         ExportMetricsServiceRequest request
     ) {
         MetricColumnarBuilder.Rows rows = columnarBuilder.buildRows(batchBuilder, request, target -> true);
         return rows == null ? List.of(false) : Collections.nCopies(rows.rowRequests().size(), true);
     }
 
-    private List<Boolean> writeRows(EscfBatchBuilder batchBuilder, ExportMetricsServiceRequest request) {
+    private List<Boolean> writeRows(OtlpMetricsBatchBuilder batchBuilder, ExportMetricsServiceRequest request) {
         return writeRows(builder, batchBuilder, request);
     }
 
@@ -137,7 +136,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(true), writeRows(batchBuilder, request));
         EscfBatch batch = batchBuilder.build();
 
@@ -172,7 +171,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(true, true), writeRows(batchBuilder, request));
         EscfBatch batch = batchBuilder.build();
 
@@ -218,7 +217,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(true), writeRows(batchBuilder, request));
         EscfBatch batch = batchBuilder.build();
 
@@ -258,7 +257,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(false), writeRows(batchBuilder, request));
         // Unsupported data points are rejected before a row is started.
         assertEquals(0, batchBuilder.docCount());
@@ -277,7 +276,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(true), writeRows(batchBuilder, request));
         EscfBatch batch = batchBuilder.build();
 
@@ -315,14 +314,14 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(false), writeRows(batchBuilder, request));
         // The failed row is aborted, not rolled back: it still occupies a row in the (to be discarded) batch.
         assertEquals(1, batchBuilder.docCount());
     }
 
     /**
-     * OTel attribute lists may contain duplicate keys, which {@code EscfBatchBuilder} rejects. There is no up-front
+     * OTel attribute lists may contain duplicate keys, which {@code OtlpMetricsBatchBuilder} rejects. There is no up-front
      * scan for this; the resulting exception must be turned into a {@code false} return while writing.
      */
     public void testBuildMetricRowReturnsFalseForDuplicateAttributeKey() throws Exception {
@@ -335,7 +334,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(false), writeRows(batchBuilder, request));
         assertEquals(1, batchBuilder.docCount());
     }
@@ -366,12 +365,12 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        EscfBatchBuilder rejecting = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder rejecting = new OtlpMetricsBatchBuilder();
         MetricColumnarBuilder withExemplarIngestion = new MetricColumnarBuilder(MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM, true);
         assertEquals(List.of(false), writeRows(withExemplarIngestion, rejecting, request));
         assertEquals(0, rejecting.docCount());
 
-        EscfBatchBuilder accepting = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder accepting = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(true), writeRows(accepting, request));
         assertEquals(1, accepting.build().docCount());
     }
@@ -413,7 +412,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             .addResourceMetrics(request.getResourceMetrics(1))
             .build();
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(false), writeRows(batchBuilder, bad));
         assertEquals(List.of(true), writeRows(batchBuilder, good));
         assertEquals("the aborted row keeps its row index", 2, batchBuilder.docCount());
@@ -458,7 +457,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         assertEquals(1, groups.size());
         assertEquals(2, groups.getFirst().dataPoints().size());
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(true, true), writeRows(batchBuilder, request));
         EscfBatch batch = batchBuilder.build();
 
@@ -499,7 +498,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         List<String> expected = new ArrayList<>();
         context.consume(group -> expected.add(group.getMetricNamesHash(new BufferedMurmur3Hasher(0))));
 
-        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(true), writeRows(batchBuilder, request));
         assertEquals(expected, readStringColumn(batchBuilder.build(), "_metric_names_hash"));
     }

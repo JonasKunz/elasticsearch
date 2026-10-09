@@ -14,6 +14,7 @@ import org.apache.lucene.util.UnicodeUtil;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasable;
+import org.elasticsearch.core.Releasables;
 import org.elasticsearch.sourcebatch.SourceBatch;
 import org.elasticsearch.sourcebatch.SourceRow;
 import org.elasticsearch.sourcebatch.SourceSchema;
@@ -37,6 +38,14 @@ public final class EscfBatch implements SourceBatch {
     private final Releasable releasable;
     private BytesReference serialized;
     private boolean closed;
+
+    /**
+     * Wraps columns produced by an external builder that writes {@link EscfColumnBuilder}s directly, for producers whose input has
+     * a known structure and so do not need the generic {@link EscfBatchBuilder}. The batch takes ownership of {@code columns}.
+     */
+    public static EscfBatch of(SourceSchema schema, int docCount, EscfColumnData[] columns) {
+        return new EscfBatch(schema, docCount, columns, Releasables.wrap(columns));
+    }
 
     /** In-memory construction path used by {@link EscfEncoder#build()}. */
     EscfBatch(SourceSchema schema, int docCount, EscfColumnData[] columnData, Releasable releasable) {

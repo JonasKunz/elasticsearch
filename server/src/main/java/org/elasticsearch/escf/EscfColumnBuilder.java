@@ -309,6 +309,64 @@ public final class EscfColumnBuilder implements Releasable {
         setBytes(row, EscfColumnKind.STRING, bytes, offset, length);
     }
 
+    /**
+     * Writes the same string into rows {@code [row, row + count)}. Equivalent to {@code count} calls of
+     * {@link #setString(int, byte[], int, int)}, but for a dictionary-encoded column the repeats cost one fill of the ordinal array.
+     */
+    public void setStringRepeated(int row, byte[] bytes, int offset, int length, int count) {
+        setString(row, bytes, offset, length);
+        if (repeatLastRow(count - 1) == false) {
+            for (int i = 1; i < count; i++) {
+                setString(row + i, bytes, offset, length);
+            }
+        }
+    }
+
+    /** Writes {@code value} into rows {@code [row, row + count)}; see {@link #setStringRepeated}. */
+    public void setLongRepeated(int row, long value, int count) {
+        setLong(row, value);
+        if (repeatLastRow(count - 1) == false) {
+            for (int i = 1; i < count; i++) {
+                setLong(row + i, value);
+            }
+        }
+    }
+
+    /** Writes {@code value} into rows {@code [row, row + count)}; see {@link #setStringRepeated}. */
+    public void setDoubleRepeated(int row, double value, int count) {
+        setDouble(row, value);
+        if (repeatLastRow(count - 1) == false) {
+            for (int i = 1; i < count; i++) {
+                setDouble(row + i, value);
+            }
+        }
+    }
+
+    /** Writes {@code value} into rows {@code [row, row + count)}; see {@link #setStringRepeated}. */
+    public void setBooleanRepeated(int row, boolean value, int count) {
+        setBoolean(row, value);
+        if (repeatLastRow(count - 1) == false) {
+            for (int i = 1; i < count; i++) {
+                setBoolean(row + i, value);
+            }
+        }
+    }
+
+    /**
+     * Repeats the value just written for another {@code times} rows, if the column layout can do so in bulk. The caller must have
+     * written that value as a new row with a {@code set*} call immediately before.
+     */
+    private boolean repeatLastRow(int times) {
+        if (times <= 0) {
+            return true;
+        }
+        if (current != null && current.repeatLast(times)) {
+            lastWrittenRow += times;
+            return true;
+        }
+        return false;
+    }
+
     public void setBinary(int row, BytesRef value) {
         setBytes(row, EscfColumnKind.BINARY, value.bytes, value.offset, value.length);
     }
@@ -852,6 +910,14 @@ public final class EscfColumnBuilder implements Releasable {
         UnionBuilder promote(Recycler<BytesRef> recycler);
 
         /** Promotion to a columnar ARRAY (scalar buffer becomes the array child); only scalar builders support it. */
+        /**
+         * Appends {@code times} more copies of the value of the last row, if that row holds a present value and this layout can
+         * repeat it cheaply. Returns {@code false}, having changed nothing, when it cannot; the caller then writes the rows one by one.
+         */
+        default boolean repeatLast(int times) {
+            return false;
+        }
+
         default ArrayBuilder promoteToArray(Recycler<BytesRef> recycler) {
             throw new AssertionError("column kind " + EscfColumnKind.name(kind()) + " cannot promote to array");
         }
@@ -865,6 +931,8 @@ public final class EscfColumnBuilder implements Releasable {
 
         int count;
         FixedBitSet validity;
+        /** Whether the last row appended holds a present value (as opposed to being absent, or there being no row yet). */
+        boolean lastPresent;
 
         @Override
         public int rowsConsumed() {
@@ -880,6 +948,7 @@ public final class EscfColumnBuilder implements Releasable {
                 validity = FixedBitSet.ensureCapacity(validity, count + 1);
             }
             count++;
+            lastPresent = false;
         }
 
         /** Marks {@code n} consecutive rows absent; materialises and grows the validity bitset once. */
@@ -893,6 +962,7 @@ public final class EscfColumnBuilder implements Releasable {
             }
             // bits [count, count+n) remain 0 (absent)
             count += n;
+            lastPresent = false;
         }
 
         /** Marks the current document present and advances {@code count}. */
@@ -902,6 +972,17 @@ public final class EscfColumnBuilder implements Releasable {
                 validity.set(count);
             }
             count++;
+            lastPresent = true;
+        }
+
+        /** Marks the next {@code n} documents present and advances {@code count}. */
+        final void bulkAdvancePresent(int n) {
+            if (validity != null) {
+                validity = FixedBitSet.ensureCapacity(validity, count + n);
+                validity.set(count, count + n);
+            }
+            count += n;
+            lastPresent = true;
         }
 
         final boolean isAbsentAt(int d) {
@@ -945,6 +1026,7 @@ public final class EscfColumnBuilder implements Releasable {
     private static final class FixedNumericBuilder extends BaseBuilder {
         private final byte kind;
         private RecyclerBytesStreamOutput data;
+        private long lastBits;
 
         FixedNumericBuilder(byte kind, Recycler<BytesRef> recycler) {
             this.kind = kind;
@@ -959,13 +1041,27 @@ public final class EscfColumnBuilder implements Releasable {
         @Override
         public void addLong(long value) {
             writeLongLE(data, value);
+            lastBits = value;
             advancePresent();
         }
 
         @Override
         public void addDouble(double value) {
-            writeLongLE(data, Double.doubleToRawLongBits(value));
+            lastBits = Double.doubleToRawLongBits(value);
+            writeLongLE(data, lastBits);
             advancePresent();
+        }
+
+        @Override
+        public boolean repeatLast(int times) {
+            if (lastPresent == false) {
+                return false;
+            }
+            for (int i = 0; i < times; i++) {
+                writeLongLE(data, lastBits);
+            }
+            bulkAdvancePresent(times);
+            return true;
         }
 
         @Override
@@ -1055,6 +1151,7 @@ public final class EscfColumnBuilder implements Releasable {
     private static final class BoolBuilder extends BaseBuilder {
 
         private FixedBitSet values;
+        private boolean lastValue;
 
         @Override
         public byte kind() {
@@ -1062,7 +1159,21 @@ public final class EscfColumnBuilder implements Releasable {
         }
 
         @Override
+        public boolean repeatLast(int times) {
+            if (lastPresent == false) {
+                return false;
+            }
+            if (lastValue) {
+                values = FixedBitSet.ensureCapacity(values, count + times);
+                values.set(count, count + times);
+            }
+            bulkAdvancePresent(times);
+            return true;
+        }
+
+        @Override
         public void addBoolean(boolean value) {
+            lastValue = value;
             if (value) {
                 values = values == null ? new FixedBitSet(Math.max(64, count + 1)) : FixedBitSet.ensureCapacity(values, count + 1);
                 values.set(count);
@@ -1257,6 +1368,17 @@ public final class EscfColumnBuilder implements Releasable {
             ordinals = ArrayUtil.grow(ordinals, count + 1);
             ordinals[count] = (char) ordinal;
             advancePresent();
+        }
+
+        @Override
+        public boolean repeatLast(int times) {
+            if (plain != null || lastPresent == false) {
+                return false;
+            }
+            ordinals = ArrayUtil.grow(ordinals, count + times);
+            Arrays.fill(ordinals, count, count + times, (char) lastOrdinal);
+            bulkAdvancePresent(times);
+            return true;
         }
 
         @Override
