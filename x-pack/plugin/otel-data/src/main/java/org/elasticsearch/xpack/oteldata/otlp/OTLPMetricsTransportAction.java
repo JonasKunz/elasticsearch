@@ -33,6 +33,7 @@ import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.Maps;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.escf.EscfBatch;
 import org.elasticsearch.escf.EscfBatchBuilder;
 import org.elasticsearch.index.Index;
@@ -62,7 +63,6 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -77,12 +77,14 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>When {@link BatchIndexingEnabled} is active cluster-wide and the request targets a single data stream whose
  * backing indices support batch indexing, the metrics are optimistically written directly into an
- * {@link EscfBatch} without a CBOR intermediate representation, and the coordinator derives {@code _tsid}
- * column-major via {@link org.elasticsearch.cluster.routing.ColumnarTsidCalculator}. Only metadata is checked up
- * front; whether the payload itself is expressible as scalar columns (gauges and monotonic sums with
+ * {@link EscfBatch}, one row per data point, without grouping data points into documents and without a CBOR
+ * intermediate representation; the coordinator derives {@code _tsid} column-major via
+ * {@link org.elasticsearch.cluster.routing.ColumnarTsidCalculator}. Only metadata is checked up
+ * front; whether the payload itself is expressible as scalar columns (gauges and sums with
  * string/bool/int/double attributes, no exemplars when exemplar ingestion is enabled) is discovered while
- * writing. If any group turns out to be unsupported, the partially built batch is discarded and the whole request
- * is written through the existing XContent path instead, so a request is never split across the two paths.
+ * writing. If any data point turns out to be unsupported, the partially built batch is discarded and the whole
+ * request is grouped and written through the existing XContent path instead, so a request is never split across
+ * the two paths.
  *
  * @see <a href="https://opentelemetry.io/docs/specs/otlp">OTLP Specification</a>
  */
@@ -131,37 +133,34 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
 
     @Override
     protected ProcessingContext prepareBulkRequest(OTLPActionRequest request, BulkRequestBuilder bulkRequestBuilder) throws IOException {
+        var metricsServiceRequest = ExportMetricsServiceRequest.parseFrom(request.getRequest().streamInput());
+        ProjectMetadata projectMetadata = clusterService.state().projectState(ProjectId.DEFAULT).metadata();
+        // Snapshot volatile setting to have it consistent for this request
+        boolean exemplarIngestionEnabled = this.exemplarIngestionEnabled;
+
+        // Optimistic ESCF path: it works directly on the parsed request, one row per data point, without grouping
+        // data points into documents first. Only cheap metadata checks happen up front; whether the payload is
+        // expressible as scalar columns is found out while writing it. On the first unsupported data point the
+        // batch is dropped and the whole request is written in doc-mode below.
+        ProcessingContext escfContext = tryAddEscfBatch(
+            bulkRequestBuilder,
+            metricsServiceRequest,
+            projectMetadata,
+            exemplarIngestionEnabled
+        );
+        if (escfContext != null) {
+            return escfContext;
+        }
+
         BufferedByteStringAccessor byteStringAccessor = new BufferedByteStringAccessor();
         DataPointGroupingContext context = new DataPointGroupingContext(byteStringAccessor, defaultMappingHints);
-        var metricsServiceRequest = ExportMetricsServiceRequest.parseFrom(request.getRequest().streamInput());
         context.groupDataPoints(metricsServiceRequest);
         if (context.totalItems() == 0) {
             return context;
         }
 
-        ProjectMetadata projectMetadata = clusterService.state().projectState(ProjectId.DEFAULT).metadata();
-
-        // Collect all groups so the ESCF attempt can be rolled back as a whole if it fails part-way.
-        // A BulkRequest carries at most one pre-built batch (keyed by index-abstraction name), so the ESCF
-        // path requires all groups to target the same data stream. Groups targeting different data streams
-        // fall through to doc-mode. Within a single data stream, BatchModeRouter handles routing to
-        // multiple backing indices automatically via timestamp-based resolution.
         List<DataPointGroupingContext.DataPointGroup> allGroups = new ArrayList<>();
         context.consume(allGroups::add);
-
-        // Snapshot volatile setting to have it consistent for this request
-        boolean exemplarIngestionEnabled = this.exemplarIngestionEnabled;
-
-        // Optimistic ESCF path: only the (cheap) metadata checks happen up front. Whether the payload is
-        // expressible as scalar columns is found out while writing it; on the first unsupported group the
-        // batch is dropped and the whole request is written in doc-mode below.
-        if (canAttemptBatchIndexing(projectMetadata, allGroups)) {
-            String target = allGroups.getFirst().targetIndex().index();
-            MetricColumnarBuilder metricColumnarBuilder = new MetricColumnarBuilder(defaultMappingHints, exemplarIngestionEnabled);
-            if (tryAddEscfBatch(bulkRequestBuilder, metricColumnarBuilder, allGroups, target)) {
-                return context;
-            }
-        }
 
         long totalExpandedBytes = 0;
         MetricDocumentBuilder metricDocumentBuilder = new MetricDocumentBuilder(byteStringAccessor, defaultMappingHints);
@@ -194,108 +193,110 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
         return context;
     }
 
-    /**
-     * Metadata-only gate for the ESCF path: batch indexing must be enabled, all groups must target the same
-     * data stream, and every backing index the groups resolve to must support batch indexing. Whether the
-     * payload itself can be written as columns is not checked here; {@link #tryAddEscfBatch} finds that out
-     * while writing and reports it through its return value.
-     */
-    boolean canAttemptBatchIndexing(ProjectMetadata projectMetadata, List<DataPointGroupingContext.DataPointGroup> groups) {
-        if (groups.isEmpty() || batchIndexingEnabled.isEnabled() == false) {
-            return false;
-        }
-        String firstTarget = groups.getFirst().targetIndex().index();
-        for (int i = 1; i < groups.size(); i++) {
-            if (firstTarget.equals(groups.get(i).targetIndex().index()) == false) {
-                return false;
-            }
-        }
-        return resolveEscfEligible(projectMetadata, firstTarget, groups);
-    }
-
     // -------------------------------------------------------------------------
     // ESCF path
     // -------------------------------------------------------------------------
 
     /**
-     * Optimistically writes all groups into a single {@link EscfBatch} and registers it, together with one
-     * {@link IndexRequest} per group, on {@code bulkRequestBuilder}.
+     * Optimistically writes every data point of {@code request} as one row of a single {@link EscfBatch} and
+     * registers the batch, together with one {@link IndexRequest} per row, on {@code bulkRequestBuilder}.
      *
-     * <p>Returns {@code false} without modifying {@code bulkRequestBuilder} if any group cannot be expressed
-     * columnar (see {@link MetricColumnarBuilder#buildMetricRow}); the partially built batch is released and
-     * the caller must write the request through the doc-mode path instead. The index requests are therefore
-     * only added to the bulk request once every row has been committed.
+     * <p>This deliberately bypasses {@link DataPointGroupingContext}: grouping data points that share resource,
+     * scope, attributes and timestamp into one document rarely combines several metrics, but costs hashing and
+     * map lookups for every data point. Rows are therefore written in request order, one per data point.
+     *
+     * <p>Returns {@code null} without modifying {@code bulkRequestBuilder} when the request cannot be written
+     * this way: batch indexing is disabled, the target data stream does not exist or does not support batch
+     * indexing, the data points target more than one data stream (a {@link org.elasticsearch.action.bulk.BulkRequest}
+     * carries at most one pre-built batch per target), the request contains no data points, or any data point
+     * cannot be expressed columnar (see {@link MetricColumnarBuilder#buildRows}). The partially built batch is
+     * released and the caller must write the request through the doc-mode path instead. The index requests are
+     * only added to the bulk request once every row has been written, so a request is never split across the
+     * two paths. Within a single data stream, {@code BatchModeRouter} handles routing to multiple backing
+     * indices automatically via timestamp-based resolution.
+     *
+     * @return a context counting the written data points, or {@code null} if the caller must fall back to doc-mode
      */
     // visible for testing
-    boolean tryAddEscfBatch(
+    @Nullable
+    ProcessingContext tryAddEscfBatch(
         BulkRequestBuilder bulkRequestBuilder,
-        MetricColumnarBuilder metricColumnarBuilder,
-        List<DataPointGroupingContext.DataPointGroup> groups,
-        String target
+        ExportMetricsServiceRequest request,
+        ProjectMetadata projectMetadata,
+        boolean exemplarIngestionEnabled
     ) throws IOException {
-        // Collect (rowIndex -> IndexRequest) during the build pass, then attach source rows after build().
-        Map<Integer, IndexRequest> rowRequests = new LinkedHashMap<>(groups.size());
-        try (EscfBatchBuilder batchBuilder = new EscfBatchBuilder(bytesRefRecycler)) {
-            for (DataPointGroupingContext.DataPointGroup group : groups) {
-                var dynamicTemplates = Maps.<String, String>newHashMapWithExpectedSize(group.dataPoints().size());
-                var dynamicTemplateParams = Maps.<String, Map<String, String>>newHashMapWithExpectedSize(group.dataPoints().size());
-
-                if (metricColumnarBuilder.buildMetricRow(batchBuilder, group, dynamicTemplates, dynamicTemplateParams) == false) {
-                    // Unsupported content: back out. Nothing has been added to the bulk request yet and closing
-                    // the builder releases the partially written column buffers.
-                    return false;
-                }
-                int rowIndex = batchBuilder.finishRow();
-
-                Instant tsTimestamp = DataStream.getCanonicalTimestampBound(
-                    Instant.ofEpochMilli(TimeUnit.NANOSECONDS.toMillis(group.getTimestampUnixNano()))
-                );
-                IndexRequest indexRequest = new IndexRequest(target).opType(DocWriteRequest.OpType.CREATE)
-                    .setRequireDataStream(true)
-                    .setIncludeSourceOnError(false)
-                    .setDynamicTemplates(dynamicTemplates)
-                    .setDynamicTemplateParams(dynamicTemplateParams)
-                    .setTimeSeriesTimestamp(tsTimestamp);
-                // Source row will be attached after build() below.
-                rowRequests.put(rowIndex, indexRequest);
-            }
-
-            // All rows are kept in one flat batch; BatchModeRouter / EscfBatchScatterer handle shard scatter downstream.
-            EscfBatch batch = batchBuilder.build();
-
-            // Guard against coordinator heap exhaustion on large fan-out OTLP exports (resource/scope
-            // attributes copied into every row mean the batch can be significantly larger than the
-            // incoming protobuf payload).
-            long batchBytes = batch.ramBytesUsed();
-            if (batchBytes > maxExpandedContentLength) {
-                batch.close();
-                throw new ElasticsearchStatusException(
-                    "OTLP request rejected: ESCF batch ["
-                        + batchBytes
-                        + " b] would exceed expanded content limit ["
-                        + maxExpandedContentLength
-                        + " b]",
-                    RestStatus.REQUEST_ENTITY_TOO_LARGE
-                );
-            }
-
-            // Attach source rows now that the batch object is stable, and only now hand the requests to the bulk
-            // request: every row has been committed, so there is no fallback to doc-mode past this point.
-            for (Map.Entry<Integer, IndexRequest> e : rowRequests.entrySet()) {
-                e.getValue().indexSource().setSourceRow(batch, e.getKey(), XContentType.JSON);
-                bulkRequestBuilder.add(e.getValue());
-            }
-
-            // Register the pre-built batch. BatchModeRouter will scatter it to shards and invoke
-            // ForIndexDimensions.indexShard(requests, batch), which calls ColumnarTsidCalculator to
-            // derive _tsid column-major (no pre-set tsid required on the IndexRequests).
-            // Ownership of the batch transfers to the bulk request here. EscfBatchBuilder.close() only
-            // releases *unbuilt* partitions (buildPartition nulls the slot), so closing the builder
-            // below does NOT close or invalidate the batch; ownership passes to the bulk action, which releases
-            // it, and AbstractOTLPTransportAction releases it if the bulk is rejected before the action takes it.
-            bulkRequestBuilder.setPreBuiltBatches(Map.of(target, batch));
-            return true;
+        if (batchIndexingEnabled.isEnabled() == false) {
+            return null;
         }
+        MetricColumnarBuilder columnarBuilder = new MetricColumnarBuilder(defaultMappingHints, exemplarIngestionEnabled);
+        try (EscfBatchBuilder batchBuilder = new EscfBatchBuilder(bytesRefRecycler)) {
+            // Cheap early exit so that streams which can never take the ESCF path do not pay for writing a batch.
+            MetricColumnarBuilder.Rows rows = columnarBuilder.buildRows(
+                batchBuilder,
+                request,
+                target -> writeIndexSupportsEscf(projectMetadata, target)
+            );
+            if (rows == null) {
+                return null;
+            }
+            return finishEscfBatch(bulkRequestBuilder, batchBuilder, rows, projectMetadata);
+        }
+    }
+
+    /**
+     * Builds the batch and hands it, together with the per-row index requests, to {@code bulkRequestBuilder}.
+     * Returns {@code null} (leaving the bulk request untouched) if nothing was written or if a backing index
+     * the rows resolve to does not support batch indexing.
+     */
+    @Nullable
+    private ProcessingContext finishEscfBatch(
+        BulkRequestBuilder bulkRequestBuilder,
+        EscfBatchBuilder batchBuilder,
+        MetricColumnarBuilder.Rows rows,
+        ProjectMetadata projectMetadata
+    ) throws IOException {
+        List<IndexRequest> rowRequests = rows.rowRequests();
+        String target = rows.target();
+        if (rowRequests.isEmpty() || backingIndicesSupportEscf(projectMetadata, target, rows.timestampsNanos()) == false) {
+            return null;
+        }
+
+        // All rows are kept in one flat batch; BatchModeRouter / EscfBatchScatterer handle shard scatter downstream.
+        EscfBatch batch = batchBuilder.build();
+
+        // Guard against coordinator heap exhaustion on large fan-out OTLP exports (resource/scope
+        // attributes copied into every row mean the batch can be significantly larger than the
+        // incoming protobuf payload).
+        long batchBytes = batch.ramBytesUsed();
+        if (batchBytes > maxExpandedContentLength) {
+            batch.close();
+            throw new ElasticsearchStatusException(
+                "OTLP request rejected: ESCF batch ["
+                    + batchBytes
+                    + " b] would exceed expanded content limit ["
+                    + maxExpandedContentLength
+                    + " b]",
+                RestStatus.REQUEST_ENTITY_TOO_LARGE
+            );
+        }
+
+        // Attach source rows now that the batch object is stable, and only now hand the requests to the bulk
+        // request: every row has been written, so there is no fallback to doc-mode past this point.
+        for (int row = 0; row < rowRequests.size(); row++) {
+            IndexRequest indexRequest = rowRequests.get(row);
+            indexRequest.indexSource().setSourceRow(batch, row, XContentType.JSON);
+            bulkRequestBuilder.add(indexRequest);
+        }
+
+        // Register the pre-built batch. BatchModeRouter will scatter it to shards and invoke
+        // ForIndexDimensions.indexShard(requests, batch), which calls ColumnarTsidCalculator to
+        // derive _tsid column-major (no pre-set tsid required on the IndexRequests).
+        // Ownership of the batch transfers to the bulk request here. EscfBatchBuilder.close() only
+        // releases unbuilt column buffers, so closing the builder does NOT close or invalidate the batch;
+        // ownership passes to the bulk action, which releases it, and AbstractOTLPTransportAction releases it
+        // if the bulk is rejected before the action takes it.
+        bulkRequestBuilder.setPreBuiltBatches(Map.of(target, batch));
+        return ProcessingContext.withTotalItems(rowRequests.size());
     }
 
     // -------------------------------------------------------------------------
@@ -355,11 +356,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
         return projectMetadata.getIndexSafe(index).getCreationVersion();
     }
 
-    private boolean resolveEscfEligible(
-        ProjectMetadata projectMetadata,
-        String dataStreamName,
-        List<DataPointGroupingContext.DataPointGroup> allGroups
-    ) {
+    private static @Nullable DataStream resolveDataStream(ProjectMetadata projectMetadata, String dataStreamName) {
         DataStream dataStream = projectMetadata.dataStreams().get(dataStreamName);
         if (dataStream == null) {
             DataStreamAlias alias = projectMetadata.dataStreamAliases().get(dataStreamName);
@@ -367,19 +364,38 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
                 dataStream = projectMetadata.dataStreams().get(alias.getWriteDataStream());
             }
         }
-        // Data stream not yet initialised → fall back to doc-mode so the first export creates it.
+        return dataStream;
+    }
+
+    private static boolean supportsEscf(ProjectMetadata projectMetadata, Index index) {
+        IndexMetadata indexMetadata = projectMetadata.getIndexSafe(index);
+        return indexMetadata.getTimeSeriesDimensions().isEmpty() == false
+            && IndexSettings.TIME_SERIES_BATCH_INDEXING.get(indexMetadata.getSettings());
+    }
+
+    /**
+     * Early, timestamp-independent check: the data stream must already exist (the first export creates it through
+     * the doc-mode path) and its current write index must support ESCF.
+     */
+    private static boolean writeIndexSupportsEscf(ProjectMetadata projectMetadata, String dataStreamName) {
+        DataStream dataStream = resolveDataStream(projectMetadata, dataStreamName);
+        if (dataStream == null || dataStream.getWriteIndex() == null) {
+            return false;
+        }
+        return supportsEscf(projectMetadata, dataStream.getWriteIndex());
+    }
+
+    /**
+     * Determines which backing indices a batch actually targets based on the timestamps of its rows, then verifies
+     * that each one supports ESCF (has dimensions and batch indexing enabled).
+     */
+    private static boolean backingIndicesSupportEscf(ProjectMetadata projectMetadata, String dataStreamName, long[] timestampsNanos) {
+        DataStream dataStream = resolveDataStream(projectMetadata, dataStreamName);
         if (dataStream == null) {
             return false;
         }
-        // Determine which backing indices the batch actually targets based on document timestamps,
-        // then verify each one supports ESCF (has dimensions and a recent enough creation version).
-        long[] timestamps = new long[allGroups.size()];
-        for (int i = 0; i < allGroups.size(); i++) {
-            timestamps[i] = allGroups.get(i).getTimestampUnixNano();
-        }
-        for (Index index : dataStream.selectTimeSeriesWriteIndices(timestamps, projectMetadata)) {
-            IndexMetadata im = projectMetadata.getIndexSafe(index);
-            if (im.getTimeSeriesDimensions().isEmpty() || IndexSettings.TIME_SERIES_BATCH_INDEXING.get(im.getSettings()) == false) {
+        for (Index index : dataStream.selectTimeSeriesWriteIndices(timestampsNanos, projectMetadata)) {
+            if (supportsEscf(projectMetadata, index) == false) {
                 return false;
             }
         }

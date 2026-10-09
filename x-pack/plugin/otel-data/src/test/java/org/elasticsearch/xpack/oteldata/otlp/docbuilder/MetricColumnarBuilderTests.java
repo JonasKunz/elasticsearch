@@ -16,6 +16,7 @@ import org.apache.lucene.document.column.LongTupleCursor;
 import org.apache.lucene.document.column.ObjectTupleCursor;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.common.hash.BufferedMurmur3Hasher;
 import org.elasticsearch.escf.EscfBatch;
 import org.elasticsearch.escf.EscfBatchBuilder;
 import org.elasticsearch.escf.EscfColumnKind;
@@ -25,10 +26,8 @@ import org.elasticsearch.xpack.oteldata.otlp.datapoint.DataPointGroupingContext;
 import org.elasticsearch.xpack.oteldata.otlp.proto.BufferedByteStringAccessor;
 
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 
 import static io.opentelemetry.proto.metrics.v1.AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE;
 import static org.elasticsearch.xpack.oteldata.otlp.OtlpUtils.createDoubleDataPoint;
@@ -50,8 +49,22 @@ public class MetricColumnarBuilderTests extends ESTestCase {
     // Helpers
     // -------------------------------------------------------------------------
 
-    private DataPointGroupingContext newContext() {
-        return new DataPointGroupingContext(new BufferedByteStringAccessor(), MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM);
+    /**
+     * Writes {@code request} with {@link MetricColumnarBuilder#buildRows}, the way the transport action does, and
+     * reports the outcome per data point: {@code [true, ...]} with one entry per written row, or {@code [false]} if
+     * the request cannot be written columnar (the batch must be discarded then).
+     */
+    private List<Boolean> writeRows(
+        MetricColumnarBuilder columnarBuilder,
+        EscfBatchBuilder batchBuilder,
+        ExportMetricsServiceRequest request
+    ) {
+        MetricColumnarBuilder.Rows rows = columnarBuilder.buildRows(batchBuilder, request, target -> true);
+        return rows == null ? List.of(false) : Collections.nCopies(rows.rowRequests().size(), true);
+    }
+
+    private List<Boolean> writeRows(EscfBatchBuilder batchBuilder, ExportMetricsServiceRequest request) {
+        return writeRows(builder, batchBuilder, request);
     }
 
     /** Returns the string values stored in the named column, in row order. */
@@ -87,6 +100,22 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         return List.of();
     }
 
+    /** Returns the double values stored in the named column, in row order. */
+    private List<Double> readDoubleColumn(EscfBatch batch, String path) {
+        SourceSchema schema = batch.schema();
+        for (int i = 0; i < schema.leafCount(); i++) {
+            if (path.equals(schema.getFullPath(i))) {
+                LongTupleCursor cursor = batch.column(i).longCursor();
+                List<Double> values = new ArrayList<>();
+                while (cursor.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+                    values.add(Double.longBitsToDouble(cursor.longValue()));
+                }
+                return values;
+            }
+        }
+        return List.of();
+    }
+
     // -------------------------------------------------------------------------
     // Tests
     // -------------------------------------------------------------------------
@@ -108,16 +137,8 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        DataPointGroupingContext context = newContext();
-        context.groupDataPoints(request);
-
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
-        context.consume(group -> {
-            Map<String, String> templates = new HashMap<>();
-            Map<String, Map<String, String>> templateParams = new HashMap<>();
-            assertTrue(builder.buildMetricRow(batchBuilder, group, templates, templateParams));
-            batchBuilder.finishRow();
-        });
+        assertEquals(List.of(true), writeRows(batchBuilder, request));
         EscfBatch batch = batchBuilder.build();
 
         assertEquals(1, batch.docCount());
@@ -151,14 +172,8 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        DataPointGroupingContext context = newContext();
-        context.groupDataPoints(request);
-
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
-        context.consume(group -> {
-            assertTrue(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>()));
-            batchBuilder.finishRow();
-        });
+        assertEquals(List.of(true, true), writeRows(batchBuilder, request));
         EscfBatch batch = batchBuilder.build();
 
         assertEquals(2, batch.docCount());
@@ -203,14 +218,8 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        DataPointGroupingContext context = newContext();
-        context.groupDataPoints(request);
-
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
-        context.consume(group -> {
-            assertTrue(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>()));
-            batchBuilder.finishRow();
-        });
+        assertEquals(List.of(true), writeRows(batchBuilder, request));
         EscfBatch batch = batchBuilder.build();
 
         assertEquals(1, batch.docCount());
@@ -219,7 +228,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         assertEquals(List.of("v2"), readStringColumn(batch, "attributes.version"));
     }
 
-    /** A histogram data point causes buildMetricRow to return false (falls back to XContent path). */
+    /** A histogram data point makes buildRows return null (falls back to XContent path). */
     public void testBuildMetricRowReturnsFalseForHistogram() throws Exception {
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
             .addResourceMetrics(
@@ -249,13 +258,10 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        DataPointGroupingContext context = newContext();
-        context.groupDataPoints(request);
-
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
-        context.consume(group -> { assertFalse(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>())); });
-        // The failed row is aborted, not rolled back: it still occupies a row in the (to be discarded) batch.
-        assertEquals(1, batchBuilder.docCount());
+        assertEquals(List.of(false), writeRows(batchBuilder, request));
+        // Unsupported data points are rejected before a row is started.
+        assertEquals(0, batchBuilder.docCount());
     }
 
     /** Dotted metric names (e.g. {@code gauge.0}) are written as a nested-path column, not a top-level key. */
@@ -271,14 +277,8 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        DataPointGroupingContext context = newContext();
-        context.groupDataPoints(request);
-
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
-        context.consume(group -> {
-            assertTrue(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>()));
-            batchBuilder.finishRow();
-        });
+        assertEquals(List.of(true), writeRows(batchBuilder, request));
         EscfBatch batch = batchBuilder.build();
 
         assertEquals(1, batch.docCount());
@@ -286,7 +286,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         assertFalse("metrics.gauge.0 column must be present", readLongColumn(batch, "metrics.gauge.0").isEmpty());
     }
 
-    /** An ARRAY attribute causes buildMetricRow to return false. */
+    /** An ARRAY attribute makes buildRows return null. */
     public void testBuildMetricRowReturnsFalseForArrayAttribute() throws Exception {
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
             .addResourceMetrics(
@@ -315,11 +315,8 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        DataPointGroupingContext context = newContext();
-        context.groupDataPoints(request);
-
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
-        context.consume(group -> { assertFalse(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>())); });
+        assertEquals(List.of(false), writeRows(batchBuilder, request));
         // The failed row is aborted, not rolled back: it still occupies a row in the (to be discarded) batch.
         assertEquals(1, batchBuilder.docCount());
     }
@@ -338,11 +335,8 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        DataPointGroupingContext context = newContext();
-        context.groupDataPoints(request);
-
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
-        context.consume(group -> { assertFalse(builder.buildMetricRow(batchBuilder, group, new HashMap<>(), new HashMap<>())); });
+        assertEquals(List.of(false), writeRows(batchBuilder, request));
         assertEquals(1, batchBuilder.docCount());
     }
 
@@ -372,20 +366,13 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        DataPointGroupingContext context = newContext();
-        context.groupDataPoints(request);
-        List<DataPointGroupingContext.DataPointGroup> groups = new ArrayList<>();
-        context.consume(groups::add);
-        assertEquals(1, groups.size());
-
         EscfBatchBuilder rejecting = new EscfBatchBuilder();
         MetricColumnarBuilder withExemplarIngestion = new MetricColumnarBuilder(MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM, true);
-        assertFalse(withExemplarIngestion.buildMetricRow(rejecting, groups.getFirst(), new HashMap<>(), new HashMap<>()));
-        assertEquals(1, rejecting.docCount());
+        assertEquals(List.of(false), writeRows(withExemplarIngestion, rejecting, request));
+        assertEquals(0, rejecting.docCount());
 
         EscfBatchBuilder accepting = new EscfBatchBuilder();
-        assertTrue(builder.buildMetricRow(accepting, groups.getFirst(), new HashMap<>(), new HashMap<>()));
-        assertEquals(0, accepting.finishRow());
+        assertEquals(List.of(true), writeRows(accepting, request));
         assertEquals(1, accepting.build().docCount());
     }
 
@@ -415,22 +402,105 @@ public class MetricColumnarBuilderTests extends ESTestCase {
             )
             .build();
 
-        DataPointGroupingContext context = newContext();
-        context.groupDataPoints(request);
-        // Group iteration order is not defined; make sure the failing ("bad") group is written first.
-        List<DataPointGroupingContext.DataPointGroup> groups = new ArrayList<>();
-        context.consume(groups::add);
-        assertEquals(2, groups.size());
-        groups.sort(Comparator.comparing(group -> group.resource().getAttributes(0).getValue().getStringValue()));
+        // The failing data point is written first. A failure ends the loop in writeRows, so write the second
+        // resource's data point separately to prove the builder is still usable.
+        ExportMetricsServiceRequest bad = request.toBuilder()
+            .clearResourceMetrics()
+            .addResourceMetrics(request.getResourceMetrics(0))
+            .build();
+        ExportMetricsServiceRequest good = request.toBuilder()
+            .clearResourceMetrics()
+            .addResourceMetrics(request.getResourceMetrics(1))
+            .build();
 
         EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
-        assertFalse(builder.buildMetricRow(batchBuilder, groups.get(0), new HashMap<>(), new HashMap<>()));
-        assertTrue(builder.buildMetricRow(batchBuilder, groups.get(1), new HashMap<>(), new HashMap<>()));
-        assertEquals("the aborted row keeps its row index", 1, batchBuilder.finishRow());
+        assertEquals(List.of(false), writeRows(batchBuilder, bad));
+        assertEquals(List.of(true), writeRows(batchBuilder, good));
+        assertEquals("the aborted row keeps its row index", 2, batchBuilder.docCount());
 
         EscfBatch batch = batchBuilder.build();
         assertEquals(2, batch.docCount());
         assertEquals(List.of("bad", "good"), readStringColumn(batch, "resource.attributes.service.name"));
         assertTrue("column from the failed row must have no values", readStringColumn(batch, "resource.attributes.tags").isEmpty());
+    }
+
+    /**
+     * Data points that the document path would group into one document (same resource, scope, attributes and
+     * timestamp) must each get their own row, carrying only their own metric and its own {@code _metric_names_hash}.
+     */
+    public void testDataPointsOfOneGroupGetOneRowEach() throws Exception {
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                createResourceMetrics(
+                    List.of(keyValue("service.name", "svc")),
+                    List.of(
+                        createScopeMetrics(
+                            "s",
+                            "1",
+                            List.of(
+                                createGaugeMetric("cpu", "1", List.of(createDoubleDataPoint(nowNanos))),
+                                createGaugeMetric("mem", "1", List.of(createLongDataPoint(nowNanos)))
+                            )
+                        )
+                    )
+                )
+            )
+            .build();
+
+        // Precondition: the document path really would have grouped both data points into one document.
+        DataPointGroupingContext context = new DataPointGroupingContext(
+            new BufferedByteStringAccessor(),
+            MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM
+        );
+        context.groupDataPoints(request);
+        List<DataPointGroupingContext.DataPointGroup> groups = new ArrayList<>();
+        context.consume(groups::add);
+        assertEquals(1, groups.size());
+        assertEquals(2, groups.getFirst().dataPoints().size());
+
+        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        assertEquals(List.of(true, true), writeRows(batchBuilder, request));
+        EscfBatch batch = batchBuilder.build();
+
+        assertEquals(2, batch.docCount());
+        assertEquals("mem has a value in exactly one row", 1, readLongColumn(batch, "metrics.mem").size());
+        assertEquals("cpu has a value in exactly one row", 1, readDoubleColumn(batch, "metrics.cpu").size());
+        List<String> hashes = readStringColumn(batch, "_metric_names_hash");
+        assertEquals(2, hashes.size());
+        assertNotEquals("each metric is its own series", hashes.get(0), hashes.get(1));
+    }
+
+    /**
+     * {@code _metric_names_hash} is a dimension, so for a data point that is the only member of its group it must be
+     * identical to the value the document path computes; otherwise the same series would get a different
+     * {@code _tsid} depending on the indexing path.
+     */
+    public void testMetricNamesHashMatchesSingleMetricGroup() throws Exception {
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                createResourceMetrics(
+                    List.of(keyValue("service.name", "svc")),
+                    List.of(
+                        createScopeMetrics(
+                            "s",
+                            "1",
+                            List.of(createGaugeMetric("system.cpu.load", "1", List.of(createDoubleDataPoint(nowNanos))))
+                        )
+                    )
+                )
+            )
+            .build();
+
+        DataPointGroupingContext context = new DataPointGroupingContext(
+            new BufferedByteStringAccessor(),
+            MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM
+        );
+        context.groupDataPoints(request);
+        List<String> expected = new ArrayList<>();
+        context.consume(group -> expected.add(group.getMetricNamesHash(new BufferedMurmur3Hasher(0))));
+
+        EscfBatchBuilder batchBuilder = new EscfBatchBuilder();
+        assertEquals(List.of(true), writeRows(batchBuilder, request));
+        assertEquals(expected, readStringColumn(batchBuilder.build(), "_metric_names_hash"));
     }
 }

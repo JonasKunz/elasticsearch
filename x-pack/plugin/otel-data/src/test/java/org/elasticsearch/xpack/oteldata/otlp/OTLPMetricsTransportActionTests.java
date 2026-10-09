@@ -47,10 +47,7 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xpack.core.XPackSettings;
 import org.elasticsearch.xpack.oteldata.OTelPlugin;
-import org.elasticsearch.xpack.oteldata.otlp.datapoint.DataPointGroupingContext;
 import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MappingHints;
-import org.elasticsearch.xpack.oteldata.otlp.docbuilder.MetricColumnarBuilder;
-import org.elasticsearch.xpack.oteldata.otlp.proto.BufferedByteStringAccessor;
 import org.mockito.ArgumentCaptor;
 
 import java.io.IOException;
@@ -411,16 +408,13 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
     }
 
     public void testBatchIndexingGateForExemplars() throws Exception {
-        assumeTrue("requires batch indexing", BatchIndexingEnabled.FEATURE_FLAG.isEnabled());
-        clusterSettings.applySettings(Settings.builder().put(BatchIndexingEnabled.BATCH_INDEXING.getKey(), true).build());
+        enableBatchIndexing();
+        ProjectMetadata projectMetadata = escfProjectMetadata(DEFAULT_TARGET);
 
-        ProjectMetadata projectMetadata = batchIndexingProject("metrics-generic.otel-default");
-
-        List<DataPointGroupingContext.DataPointGroup> groups = collectGroups(
-            ExportMetricsServiceRequest.parseFrom(createMetricsRequest(createMetric()).getRequest().streamInput())
+        ExportMetricsServiceRequest plain = ExportMetricsServiceRequest.parseFrom(
+            createMetricsRequest(createMetric()).getRequest().streamInput()
         );
-        assertTrue(metricsAction.canAttemptBatchIndexing(projectMetadata, groups));
-        assertEscfAttempt(groups, true, true);
+        assertEscfAttempt(plain, projectMetadata, true, 1);
 
         Exemplar exemplar = OtlpUtils.createLongExemplar(1_000_000L, 42L);
         Metric metricWithExemplar = OtlpUtils.createGaugeMetric(
@@ -428,15 +422,13 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             "",
             List.of(OtlpUtils.createDoubleDataPoint(2_000_000L, 0, List.of(), List.of(exemplar)))
         );
-        List<DataPointGroupingContext.DataPointGroup> groupsWithExemplars = collectGroups(
-            ExportMetricsServiceRequest.parseFrom(createMetricsRequest(metricWithExemplar).getRequest().streamInput())
+        ExportMetricsServiceRequest withExemplars = ExportMetricsServiceRequest.parseFrom(
+            createMetricsRequest(metricWithExemplar).getRequest().streamInput()
         );
 
-        // The metadata gate does not look at the payload; the exemplar is only discovered while writing the batch,
-        // and only matters when exemplar ingestion is enabled.
-        assertTrue(metricsAction.canAttemptBatchIndexing(projectMetadata, groupsWithExemplars));
-        assertEscfAttempt(groupsWithExemplars, true, false);
-        assertEscfAttempt(groupsWithExemplars, false, true);
+        // The exemplar is only discovered while writing the batch, and only matters when exemplar ingestion is enabled.
+        assertEscfAttempt(withExemplars, projectMetadata, true, FALLBACK);
+        assertEscfAttempt(withExemplars, projectMetadata, false, 1);
     }
 
     public void testAttributeFanoutReturns413() {
@@ -479,10 +471,11 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
     }
 
     /**
-     * A data-point group whose resource carries an ARRAY attribute must make the optimistic ESCF attempt back out
+     * A data point whose resource carries an ARRAY attribute must make the optimistic ESCF attempt back out
      * so the transport action falls back to doc-mode, leaving nothing behind in the bulk request.
      */
     public void testEscfAttemptBacksOutForArrayResourceAttribute() throws Exception {
+        enableBatchIndexing();
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
             .addResourceMetrics(
                 OtlpUtils.createResourceMetrics(
@@ -498,14 +491,15 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             )
             .build();
 
-        assertEscfAttempt(collectGroups(request), false, false);
+        assertEscfAttempt(request, escfProjectMetadata(DEFAULT_TARGET), false, FALLBACK);
     }
 
     /**
-     * A data-point group whose attribute list contains a duplicate key is rejected by {@code EscfBatchBuilder} with an
+     * A data point whose attribute list contains a duplicate key is rejected by {@code EscfBatchBuilder} with an
      * {@code IllegalArgumentException}; the ESCF attempt must turn that into a clean fallback instead of a 500.
      */
     public void testEscfAttemptBacksOutForDuplicateDataPointAttributeKey() throws Exception {
+        enableBatchIndexing();
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
             .addResourceMetrics(
                 OtlpUtils.createResourceMetrics(
@@ -533,14 +527,15 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             )
             .build();
 
-        assertEscfAttempt(collectGroups(request), false, false);
+        assertEscfAttempt(request, escfProjectMetadata(DEFAULT_TARGET), false, FALLBACK);
     }
 
     /**
-     * When only a later group is unsupported, the rows already committed for the earlier groups must be rolled
+     * When only a later data point is unsupported, the rows already written for the earlier ones must be rolled
      * back as well: the bulk request ends up with no index requests and no pre-built batch.
      */
     public void testEscfAttemptBacksOutAfterPartialProgress() throws Exception {
+        enableBatchIndexing();
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
             .addResourceMetrics(
                 OtlpUtils.createResourceMetrics(
@@ -565,13 +560,12 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             )
             .build();
 
-        List<DataPointGroupingContext.DataPointGroup> groups = collectGroups(request);
-        assertThat("distinct timestamps must produce one group each", groups.size(), equalTo(3));
-        assertEscfAttempt(groups, false, false);
+        assertEscfAttempt(request, escfProjectMetadata(DEFAULT_TARGET), false, FALLBACK);
     }
 
-    /** Scalar-only groups with unique keys go through the ESCF path. */
+    /** Scalar-only data points with unique attribute keys go through the ESCF path. */
     public void testEscfAttemptSucceedsForScalarAttributes() throws Exception {
+        enableBatchIndexing();
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
             .addResourceMetrics(
                 OtlpUtils.createResourceMetrics(
@@ -593,50 +587,168 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
             )
             .build();
 
-        assertEscfAttempt(collectGroups(request), false, true);
+        assertEscfAttempt(request, escfProjectMetadata(DEFAULT_TARGET), false, 1);
+    }
+
+    /**
+     * Data points that the document path would merge into a single document (same resource, scope, attributes and
+     * timestamp) are written as one row each on the ESCF path, and each row gets its own index request.
+     */
+    public void testEscfAttemptWritesOneRowPerDataPoint() throws Exception {
+        enableBatchIndexing();
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                OtlpUtils.createResourceMetrics(
+                    List.of(keyValue("service.name", "svc")),
+                    List.of(
+                        OtlpUtils.createScopeMetrics(
+                            "s",
+                            "1",
+                            List.of(
+                                OtlpUtils.createGaugeMetric("cpu", "1", List.of(OtlpUtils.createDoubleDataPoint(1_000_000L))),
+                                OtlpUtils.createGaugeMetric("mem", "1", List.of(OtlpUtils.createDoubleDataPoint(1_000_000L))),
+                                OtlpUtils.createGaugeMetric(
+                                    "disk",
+                                    "1",
+                                    List.of(OtlpUtils.createDoubleDataPoint(1_000_000L), OtlpUtils.createDoubleDataPoint(2_000_000L))
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+            .build();
+
+        assertEscfAttempt(request, escfProjectMetadata(DEFAULT_TARGET), false, 4);
+    }
+
+    /** A request spanning several data streams cannot be a single batch and must fall back to doc-mode. */
+    public void testEscfAttemptBacksOutForMultipleTargets() throws Exception {
+        enableBatchIndexing();
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                OtlpUtils.createResourceMetrics(
+                    List.of(keyValue("service.name", "svc"), keyValue("data_stream.dataset", "one")),
+                    List.of(
+                        OtlpUtils.createScopeMetrics(
+                            "s",
+                            "1",
+                            List.of(OtlpUtils.createGaugeMetric("cpu", "1", List.of(OtlpUtils.createDoubleDataPoint(0))))
+                        )
+                    )
+                )
+            )
+            .addResourceMetrics(
+                OtlpUtils.createResourceMetrics(
+                    List.of(keyValue("service.name", "svc"), keyValue("data_stream.dataset", "two")),
+                    List.of(
+                        OtlpUtils.createScopeMetrics(
+                            "s",
+                            "1",
+                            List.of(OtlpUtils.createGaugeMetric("cpu", "1", List.of(OtlpUtils.createDoubleDataPoint(0))))
+                        )
+                    )
+                )
+            )
+            .build();
+
+        // The first data point's data stream is fine; the second one targets a different stream.
+        assertEscfAttempt(request, escfProjectMetadata("metrics-one.otel-default"), false, FALLBACK);
+    }
+
+    /** The first export to a stream that does not exist yet must take doc-mode, which creates the data stream. */
+    public void testEscfAttemptBacksOutWithoutExistingDataStream() throws Exception {
+        enableBatchIndexing();
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.parseFrom(
+            createMetricsRequest(createMetric()).getRequest().streamInput()
+        );
+        assertEscfAttempt(request, ProjectMetadata.builder(ProjectId.DEFAULT).build(), false, FALLBACK);
+    }
+
+    public void testEscfAttemptBacksOutWhenBatchIndexingIsDisabled() throws Exception {
+        assumeTrue("requires batch indexing", BatchIndexingEnabled.FEATURE_FLAG.isEnabled());
+        clusterSettings.applySettings(Settings.builder().put(BatchIndexingEnabled.BATCH_INDEXING.getKey(), false).build());
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.parseFrom(
+            createMetricsRequest(createMetric()).getRequest().streamInput()
+        );
+        assertEscfAttempt(request, escfProjectMetadata(DEFAULT_TARGET), false, FALLBACK);
+    }
+
+    public void testEscfAttemptBacksOutForEmptyRequest() throws Exception {
+        enableBatchIndexing();
+        assertEscfAttempt(ExportMetricsServiceRequest.getDefaultInstance(), escfProjectMetadata(DEFAULT_TARGET), false, FALLBACK);
+    }
+
+    private static final String DEFAULT_TARGET = "metrics-generic.otel-default";
+    /** Expected outcome of {@link #assertEscfAttempt}: the attempt backs out and the request is written in doc-mode. */
+    private static final int FALLBACK = -1;
+
+    private void enableBatchIndexing() {
+        assumeTrue("requires batch indexing", BatchIndexingEnabled.FEATURE_FLAG.isEnabled());
+        clusterSettings.applySettings(Settings.builder().put(BatchIndexingEnabled.BATCH_INDEXING.getKey(), true).build());
+    }
+
+    /** Metadata of a single time-series backing index with dimensions and batch indexing enabled. */
+    private IndexMetadata escfIndexMetadata(String target) {
+        Index index = new Index(".ds-" + target + "-000001", randomUUID());
+        return IndexMetadata.builder(index.getName())
+            .settings(
+                settings(IndexVersion.current()).put(IndexMetadata.SETTING_INDEX_UUID, index.getUUID())
+                    .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put(IndexSettings.MODE.getKey(), "time_series")
+                    .put(IndexSettings.TIME_SERIES_START_TIME.getKey(), "1969-01-01T00:00:00Z")
+                    .put(IndexSettings.TIME_SERIES_END_TIME.getKey(), "1971-01-01T00:00:00Z")
+                    .putList(IndexMetadata.INDEX_DIMENSIONS.getKey(), "dimension")
+                    .put(IndexSettings.TIME_SERIES_BATCH_INDEXING.getKey(), true)
+            )
+            .build();
+    }
+
+    /** Project metadata holding an ESCF-capable time-series data stream named {@code target}. */
+    private ProjectMetadata escfProjectMetadata(String target) {
+        IndexMetadata indexMetadata = escfIndexMetadata(target);
+        DataStream dataStream = DataStream.builder(target, List.of(indexMetadata.getIndex())).setIndexMode(IndexMode.TIME_SERIES).build();
+        return ProjectMetadata.builder(ProjectId.DEFAULT)
+            .put(indexMetadata, true)
+            .dataStreams(Map.of(target, dataStream), Map.of())
+            .build();
     }
 
     /**
      * Runs {@link OTLPMetricsTransportAction#tryAddEscfBatch} on a fresh bulk request and asserts the outcome: on
-     * success the bulk request holds one index request per group plus the pre-built batch for the target; on
-     * fallback it must be left completely untouched.
+     * success ({@code expectedRows >= 0}) the bulk request holds one index request per data point plus the pre-built
+     * batch for the target, and the returned context counts the data points; on {@link #FALLBACK} the attempt returns
+     * {@code null} and the bulk request must be left completely untouched.
      */
     private void assertEscfAttempt(
-        List<DataPointGroupingContext.DataPointGroup> groups,
+        ExportMetricsServiceRequest request,
+        ProjectMetadata projectMetadata,
         boolean exemplarIngestionEnabled,
-        boolean expectedSuccess
+        int expectedRows
     ) throws IOException {
-        String target = groups.getFirst().targetIndex().index();
         BulkRequestBuilder bulkRequestBuilder = new BulkRequestBuilder(client);
-        MetricColumnarBuilder columnarBuilder = new MetricColumnarBuilder(
-            MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM,
+        AbstractOTLPTransportAction.ProcessingContext context = metricsAction.tryAddEscfBatch(
+            bulkRequestBuilder,
+            request,
+            projectMetadata,
             exemplarIngestionEnabled
         );
-        boolean success = metricsAction.tryAddEscfBatch(bulkRequestBuilder, columnarBuilder, groups, target);
-        assertThat(success, equalTo(expectedSuccess));
         BulkRequest bulkRequest = bulkRequestBuilder.request();
         try {
-            if (expectedSuccess) {
-                assertThat(bulkRequest.numberOfActions(), equalTo(groups.size()));
+            if (expectedRows != FALLBACK) {
+                assertNotNull("expected the ESCF attempt to succeed", context);
+                assertThat(context.totalItems(), equalTo(expectedRows));
+                assertThat(bulkRequest.numberOfActions(), equalTo(expectedRows));
                 assertTrue("pre-built batch must be registered", bulkRequest.hasPreBuiltBatches());
             } else {
+                assertNull("expected the ESCF attempt to back out", context);
                 assertThat("fallback must not leave index requests behind", bulkRequest.numberOfActions(), equalTo(0));
                 assertFalse("fallback must not leave a pre-built batch behind", bulkRequest.hasPreBuiltBatches());
             }
         } finally {
             bulkRequest.releasePreBuiltBatches();
         }
-    }
-
-    private static List<DataPointGroupingContext.DataPointGroup> collectGroups(ExportMetricsServiceRequest request) throws Exception {
-        DataPointGroupingContext ctx = new DataPointGroupingContext(
-            new BufferedByteStringAccessor(),
-            MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM
-        );
-        ctx.groupDataPoints(request);
-        List<DataPointGroupingContext.DataPointGroup> groups = new ArrayList<>();
-        ctx.consume(groups::add);
-        return groups;
     }
 
     // --- helpers ---
