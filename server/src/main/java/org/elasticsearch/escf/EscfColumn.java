@@ -65,13 +65,9 @@ public abstract class EscfColumn implements SliceableColumn {
      * storage (no per-value copy). Symmetric with {@link #from(EscfColumnData)}, this enables
      * mapper code outside this package to re-wrap a source column under a different Lucene field
      * type without going through the value-at-a-time {@link EscfColumnBuilder}.
-     *
-     * <p>The result is always in the plain layout (see {@link EscfColumnData#ofVarWidth}) for STRING, even when this column is
-     * dictionary-encoded, because callers such as the Lucene binary-column wrappers rely on one offset per document. For a
-     * dictionary-encoded column that costs one materialization (cached), so prefer {@link #bytesRefCursor} when only reading.
      */
     public final EscfColumnData columnData() {
-        return toPlainColumnData();
+        return toColumnData();
     }
 
     /** Builds the typed column view for {@code col}, dispatching on its kind. The fields are already native. */
@@ -82,9 +78,7 @@ public abstract class EscfColumn implements SliceableColumn {
             case EscfColumnKind.LONG -> new EscfLongColumn(docCount, validity, col.data());
             case EscfColumnKind.DOUBLE -> new EscfDoubleColumn(docCount, validity, col.data());
             case EscfColumnKind.BOOL -> new EscfBoolColumn(docCount, validity, windowBitSet(col.values(), 0, docCount));
-            case EscfColumnKind.STRING -> col.isDictionaryEncoded()
-                ? new EscfDictStringColumn(docCount, validity, col.ordinals(), 0, col.offsets(), col.data())
-                : new EscfStringColumn(docCount, validity, col.data(), new IntsRef(col.offsets(), 0, docCount + 1));
+            case EscfColumnKind.STRING -> new EscfStringColumn(docCount, validity, col.data(), new IntsRef(col.offsets(), 0, docCount + 1));
             case EscfColumnKind.BINARY -> new EscfBinaryColumn(docCount, validity, col.data(), new IntsRef(col.offsets(), 0, docCount + 1));
             case EscfColumnKind.ARRAY -> new EscfArrayColumn(
                 docCount,
@@ -265,13 +259,7 @@ public abstract class EscfColumn implements SliceableColumn {
 
     abstract EscfColumn sliceInternal(int from, int count);
 
-    /** This column in its native physical layout, which is what the wire format and batch accounting work on. */
     abstract EscfColumnData toColumnData();
-
-    /** This column in the plain per-document layout; differs from {@link #toColumnData()} only for dictionary-encoded columns. */
-    EscfColumnData toPlainColumnData() {
-        return toColumnData();
-    }
 
     /**
      * Extracts a {@code count}-bit window of an validity bitset (bit set = present) starting

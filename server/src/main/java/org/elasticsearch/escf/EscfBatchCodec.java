@@ -38,11 +38,7 @@ import java.util.List;
  * [Column Data]   per leaf, present fields concatenated: [validity_bitset] [type_vector] [offsets] [data]
  * </pre>
  * {@code present_flags} bit 0 = Arrow-style validity bitset (bit set = present), bit 1 = type vector,
- * bit 2 = offsets, bit 3 = dictionary; the data field is always present. {@code base_offset} is relative to {@code data_offset}.
- *
- * <p>A STRING column with the dictionary bit set is dictionary-encoded: its offsets field holds {@code dictionary_size + 1}
- * offsets (not one per document) and its data field is {@code dictionary_values | ordinals}, where the ordinals are one
- * unsigned 16-bit little-endian value per document.
+ * bit 2 = offsets; the data field is always present. {@code base_offset} is relative to {@code data_offset}.
  */
 final class EscfBatchCodec {
 
@@ -56,7 +52,6 @@ final class EscfBatchCodec {
     private static final int FLAG_VALIDITY = 0x1;
     private static final int FLAG_TYPE_VECTOR = 0x2;
     private static final int FLAG_OFFSETS = 0x4;
-    private static final int FLAG_DICTIONARY = 0x8;
 
     private EscfBatchCodec() {}
 
@@ -108,14 +103,9 @@ final class EscfBatchCodec {
                 typeVector = new BytesRef(bytesToByteArray(data, pos, typeVecLen));
                 pos += typeVecLen;
             }
-            boolean dictionary = (flags & FLAG_DICTIONARY) != 0;
-            if (dictionary && kind != EscfColumnKind.STRING) {
-                throw new IllegalArgumentException("only STRING columns can be dictionary-encoded, got " + EscfColumnKind.name(kind));
-            }
             int[] offsets = null;
             if ((flags & FLAG_OFFSETS) != 0) {
-                // a dictionary column stores one offset per dictionary entry rather than one per document
-                offsets = bytesToOffsets(data, pos, dictionary ? offsetsLen / 4 - 1 : docCount);
+                offsets = bytesToOffsets(data, pos, docCount);
                 pos += offsetsLen;
             }
             // For BOOL the data field carries the value bitset; ARRAY carries a nested child column;
@@ -129,9 +119,13 @@ final class EscfBatchCodec {
                     decodeArrayChild(data, pos, dataLen, offsets[docCount])
                 );
                 case EscfColumnKind.UNION -> EscfColumnData.ofUnion(docCount, validity, typeVector, offsets, data.slice(pos, dataLen));
-                case EscfColumnKind.STRING, EscfColumnKind.BINARY -> dictionary
-                    ? decodeDictString(data, pos, dataLen, docCount, validity, offsets)
-                    : EscfColumnData.ofVarWidth(kind, docCount, validity, offsets, data.slice(pos, dataLen));
+                case EscfColumnKind.STRING, EscfColumnKind.BINARY -> EscfColumnData.ofVarWidth(
+                    kind,
+                    docCount,
+                    validity,
+                    offsets,
+                    data.slice(pos, dataLen)
+                );
                 case EscfColumnKind.LONG, EscfColumnKind.DOUBLE -> EscfColumnData.ofFixed64(
                     kind,
                     docCount,
@@ -172,8 +166,6 @@ final class EscfBatchCodec {
                 dataPart[c] = bitsetToRef(col.values(), docCount);
             } else if (col.kind() == EscfColumnKind.ARRAY) {
                 dataPart[c] = encodeArrayChild(col.child());
-            } else if (col.isDictionaryEncoded()) {
-                dataPart[c] = CompositeBytesReference.of(col.data(), ordinalsToRef(col.ordinals(), docCount));
             } else {
                 dataPart[c] = col.data();
             }
@@ -198,9 +190,6 @@ final class EscfBatchCodec {
                 cumDataOffset += offsetsPart[c].length();
             }
             cumDataOffset += dataPart[c].length();
-            if (columns[c].isDictionaryEncoded()) {
-                f |= FLAG_DICTIONARY;
-            }
             flags[c] = f;
         }
         int totalSize = dataOffset + cumDataOffset;
@@ -340,54 +329,6 @@ final class EscfBatchCodec {
             }
         }
         return new BytesArray(out);
-    }
-
-    /** Encodes {@code count} ordinals as unsigned 16-bit little-endian values. */
-    static BytesReference ordinalsToRef(char[] ordinals, int count) {
-        byte[] out = new byte[count * 2];
-        for (int i = 0; i < count; i++) {
-            writeShortLE(out, i * 2, ordinals[i]);
-        }
-        return new BytesArray(out);
-    }
-
-    /**
-     * Parses a dictionary-encoded STRING column from its {@code dictionary_values | ordinals} data field. The dictionary
-     * offsets have already been read; the ordinals follow the last dictionary byte.
-     */
-    private static EscfColumnData decodeDictString(
-        BytesReference data,
-        int pos,
-        int dataLen,
-        int docCount,
-        FixedBitSet validity,
-        int[] dictOffsets
-    ) {
-        int dictionarySize = dictOffsets.length - 1;
-        int dictLen = dictOffsets[dictionarySize];
-        if (dictionarySize > EscfColumnData.MAX_DICTIONARY_SIZE || dictLen < 0 || dictLen + 2L * docCount != dataLen) {
-            throw new IllegalArgumentException(
-                "corrupt dictionary column: dictionary size ["
-                    + dictionarySize
-                    + "], dictionary bytes ["
-                    + dictLen
-                    + "], data ["
-                    + dataLen
-                    + "]"
-            );
-        }
-        char[] ordinals = new char[docCount];
-        BytesRef ordinalBytes = data.slice(pos + dictLen, 2 * docCount).toBytesRef();
-        for (int i = 0; i < docCount; i++) {
-            int at = ordinalBytes.offset + i * 2;
-            ordinals[i] = (char) ((ordinalBytes.bytes[at] & 0xFF) | ((ordinalBytes.bytes[at + 1] & 0xFF) << 8));
-            if (ordinals[i] >= dictionarySize && (validity == null || validity.get(i))) {
-                throw new IllegalArgumentException(
-                    "corrupt dictionary column: ordinal [" + (int) ordinals[i] + "] of document [" + i + "] is out of range"
-                );
-            }
-        }
-        return EscfColumnData.ofDictString(docCount, validity, dictOffsets, data.slice(pos, dictLen), ordinals);
     }
 
     static BytesReference intArrayToRef(int[] values) {

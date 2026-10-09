@@ -97,15 +97,7 @@ public final class EscfEncoder implements SourceBatchEncoder {
      *                  to obtain a baseline for differential comparison
      */
     public EscfEncoder(Recycler<BytesRef> recycler, boolean allowSimd) {
-        this(recycler, allowSimd, false);
-    }
-
-    /**
-     * @param allowSimd         pass {@code false} to force the Jackson path; used by tests and benchmarks to obtain a baseline
-     * @param dictionaryStrings build STRING columns dictionary-encoded (see {@link EscfBatchBuilder#EscfBatchBuilder(Recycler, boolean)})
-     */
-    public EscfEncoder(Recycler<BytesRef> recycler, boolean allowSimd, boolean dictionaryStrings) {
-        this.backend = new EscfBatchBuilder(recycler, dictionaryStrings);
+        this.backend = new EscfBatchBuilder(recycler);
         this.docParser = allowSimd && isSimdEnabled() ? SimdJsonParserPool.getDefault().forCurrentThread() : null;
     }
 

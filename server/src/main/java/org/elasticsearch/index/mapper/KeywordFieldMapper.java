@@ -65,7 +65,6 @@ import org.elasticsearch.escf.EscfColumnData;
 import org.elasticsearch.escf.EscfColumnKind;
 import org.elasticsearch.escf.EscfColumnTransforms;
 import org.elasticsearch.escf.LuceneBinaryColumn;
-import org.elasticsearch.escf.LuceneDictionaryColumn;
 import org.elasticsearch.escf.LuceneLongColumn;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.index.IndexSettings;
@@ -2226,27 +2225,16 @@ public final class KeywordFieldMapper extends FieldMapper {
             // For binary doc values the terms and dv columns may share one serialization (emitSharedColumn).
             if (valuesProduced) {
                 if (emitSharedColumn) {
-                    // A dictionary-encoded source (and nothing dropped from it) goes to Lucene as its dictionary plus ordinals, so
-                    // it is never expanded to one value per row. Only a binary doc values column below needs the expanded form.
-                    final boolean binaryDvs = emitDvs && columnarPayload == false && sortedSetDvs == false;
-                    final LuceneDictionaryColumn dictionaryTerms = values == null && (emitTerms || sortedSetDvs)
-                        ? LuceneDictionaryColumn.of(source, fieldType().name(), fieldType)
-                        : null;
-                    final boolean plainTerms = (emitTerms || sortedSetDvs) && dictionaryTerms == null;
-                    final EscfColumnData data = values != null
-                        ? values.finish(docCount)
-                        : (plainTerms || binaryDvs ? source.columnData() : null);
+                    final EscfColumnData data = values != null ? values.finish(docCount) : source.columnData();
                     if (values != null) {
                         // Only the built column owns buffers; the zero-copy branch aliases the source batch,
                         // which releases them itself. Registered once because two columns share the data.
                         ctx.addResource(data);
                     }
-                    if (dictionaryTerms != null) {
-                        ctx.addColumn(dictionaryTerms);
-                    } else if (plainTerms) {
+                    if (emitTerms || sortedSetDvs) {
                         ctx.addColumn(LuceneBinaryColumn.of(data, fieldType().name(), fieldType));
                     }
-                    if (binaryDvs) {
+                    if (emitDvs && columnarPayload == false && sortedSetDvs == false) {
                         ctx.addColumn(LuceneBinaryColumn.of(data, fieldType().name(), BinaryDocValuesField.TYPE));
                     }
                 }

@@ -25,9 +25,9 @@ public class OtlpMetricsBatchBuilderTests extends ESTestCase {
      * Writes {@code blocks} blocks of resource/scope-like fields followed by per-row fields. With {@code useBlocks} the shared fields
      * are written once per block, otherwise in every row; both must produce the same batch.
      */
-    private static EscfBatch write(boolean useBlocks, long seed, boolean dictionaryStrings) {
+    private static EscfBatch write(boolean useBlocks, long seed) {
         Random random = new Random(seed);
-        try (OtlpMetricsBatchBuilder builder = new OtlpMetricsBatchBuilder(BytesRefRecycler.NON_RECYCLING_INSTANCE, dictionaryStrings)) {
+        try (OtlpMetricsBatchBuilder builder = new OtlpMetricsBatchBuilder(BytesRefRecycler.NON_RECYCLING_INSTANCE)) {
             int blocks = 1 + random.nextInt(5);
             for (int b = 0; b < blocks; b++) {
                 int rows = 1 + random.nextInt(20);
@@ -110,14 +110,12 @@ public class OtlpMetricsBatchBuilderTests extends ESTestCase {
     }
 
     public void testBlockFieldsEqualPerRowFields() {
-        for (boolean dictionaryStrings : new boolean[] { true, false }) {
-            for (int i = 0; i < 50; i++) {
-                long seed = randomLong();
-                try (EscfBatch blocks = write(true, seed, dictionaryStrings); EscfBatch rows = write(false, seed, dictionaryStrings)) {
-                    assertEquals(rows.docCount(), blocks.docCount());
-                    BytesReference expected = rows.data();
-                    assertEquals("seed " + seed, expected, blocks.data());
-                }
+        for (int i = 0; i < 50; i++) {
+            long seed = randomLong();
+            try (EscfBatch blocks = write(true, seed); EscfBatch rows = write(false, seed)) {
+                assertEquals(rows.docCount(), blocks.docCount());
+                BytesReference expected = rows.data();
+                assertEquals("seed " + seed, expected, blocks.data());
             }
         }
     }
