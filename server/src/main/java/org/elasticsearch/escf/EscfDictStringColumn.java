@@ -137,8 +137,13 @@ final class EscfDictStringColumn extends EscfColumn {
         return entries;
     }
 
+    /** The total size in bytes of all dictionary entries. */
+    int dictionaryBytes() {
+        return dictOffsets[dictionarySize()] - dictOffsets[0];
+    }
+
     /** Points {@code into} at dictionary entry {@code ordinal} and returns it. */
-    private BytesRef entry(int ordinal, BytesRef into) {
+    BytesRef entry(int ordinal, BytesRef into) {
         int start = dictOffsets[ordinal];
         into.bytes = dictBytes;
         into.offset = dictBase + start;

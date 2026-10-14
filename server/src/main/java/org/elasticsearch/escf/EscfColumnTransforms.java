@@ -12,11 +12,14 @@ package org.elasticsearch.escf;
 import org.apache.lucene.document.column.ObjectTupleCursor;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.sourcebatch.ArrayReader;
 import org.elasticsearch.sourcebatch.SourceValueType;
 import org.elasticsearch.xcontent.XContentString;
 
 import java.util.Arrays;
+import java.util.function.UnaryOperator;
 
 /** Adapts {@link EscfColumn} data into typed cursors for use by field mappers. */
 public final class EscfColumnTransforms {
@@ -99,6 +102,49 @@ public final class EscfColumnTransforms {
             }
         }
         return true;
+    }
+
+    /**
+     * Re-encodes a dictionary-encoded STRING column by applying {@code mapper} to each distinct value once, keeping the per-document
+     * ordinals and validity as they are. This is how a mapper that derives a term from a string (a {@code version} field, for
+     * example) avoids paying the derivation per row for a column whose values repeat.
+     *
+     * <p>The mapped values are copied into the result, so {@code mapper} may return a {@link BytesRef} it reuses. The result owns
+     * heap buffers only, so closing it is a no-op.
+     *
+     * @return the re-encoded column, or {@code null} when {@code column} is not dictionary-encoded or has no present value, in
+     *         which case the caller takes its row-wise path
+     */
+    @Nullable
+    public static EscfColumnData mapDictionary(EscfColumn column, UnaryOperator<BytesRef> mapper) {
+        if (column instanceof EscfDictStringColumn dictionary && dictionary.dictionarySize() > 0) {
+            return mapDictionary(dictionary, mapper);
+        }
+        return null;
+    }
+
+    private static EscfColumnData mapDictionary(EscfDictStringColumn dictionary, UnaryOperator<BytesRef> mapper) {
+        final int size = dictionary.dictionarySize();
+        final int[] offsets = new int[size + 1];
+        byte[] bytes = new byte[Math.max(16, dictionary.dictionaryBytes() * 2)];
+        final BytesRef entry = new BytesRef();
+        for (int ordinal = 0; ordinal < size; ordinal++) {
+            final BytesRef mapped = mapper.apply(dictionary.entry(ordinal, entry));
+            final int end = offsets[ordinal] + mapped.length;
+            if (end > bytes.length) {
+                bytes = Arrays.copyOf(bytes, Math.max(end, bytes.length * 2));
+            }
+            System.arraycopy(mapped.bytes, mapped.offset, bytes, offsets[ordinal], mapped.length);
+            offsets[ordinal + 1] = end;
+        }
+        final EscfColumnData source = dictionary.toColumnData();
+        return EscfColumnData.ofDictString(
+            source.docCount(),
+            source.validity(),
+            offsets,
+            new BytesArray(bytes, 0, offsets[size]),
+            source.ordinals()
+        );
     }
 
     /**

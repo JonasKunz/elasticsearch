@@ -335,4 +335,70 @@ public class EscfColumnTransformsTests extends ESTestCase {
         }
         throw new AssertionError("Column '" + path + "' not found in batch schema");
     }
+
+    public void testMapDictionary_encodesEachEntryOnceAndKeepsOrdinals() {
+        EscfColumnBuilder b = new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, BytesRefRecycler.NON_RECYCLING_INSTANCE, true);
+        int docCount = randomIntBetween(1, 2000);
+        String[] values = { "1.0.0", "2.0.0", "3.0.0-beta" };
+        String[] expected = new String[docCount];
+        for (int doc = 0; doc < docCount; doc++) {
+            if (randomInt(3) == 0) {
+                continue; // absent
+            }
+            expected[doc] = randomFrom(values);
+            b.setString(doc, new BytesRef(expected[doc]));
+        }
+        try (EscfColumnData data = b.finish(docCount)) {
+            EscfColumn source = EscfColumn.from(data);
+            if (data.isDictionaryEncoded() == false) {
+                assertNull(EscfColumnTransforms.mapDictionary(source, v -> v)); // all absent
+                return;
+            }
+            List<String> seen = new ArrayList<>();
+            BytesRef reused = new BytesRef();
+            EscfColumnData mapped = EscfColumnTransforms.mapDictionary(source, v -> {
+                seen.add(v.utf8ToString());
+                // return a reused BytesRef to check the transform copies the mapped value
+                reused.bytes = ("v:" + v.utf8ToString()).getBytes(StandardCharsets.UTF_8);
+                reused.offset = 0;
+                reused.length = reused.bytes.length;
+                return reused;
+            });
+            assertNotNull(mapped);
+            assertTrue(mapped.isDictionaryEncoded());
+            assertEquals("each distinct value is mapped exactly once", seen.size(), seen.stream().distinct().count());
+            EscfColumn result = EscfColumn.from(mapped);
+            assertEquals(docCount, result.docCount);
+            for (int doc = 0; doc < docCount; doc++) {
+                if (expected[doc] == null) {
+                    assertTrue(result.isAbsent(doc));
+                } else {
+                    assertEquals("v:" + expected[doc], result.getBinaryValue(doc).utf8ToString());
+                }
+            }
+            // a slice of the source maps to a column over the same window
+            int from = randomIntBetween(0, docCount - 1);
+            int count = randomIntBetween(1, docCount - from);
+            EscfColumn slice = source.sliceInternal(from, count);
+            EscfColumnData mappedSlice = EscfColumnTransforms.mapDictionary(slice, v -> new BytesRef("s:" + v.utf8ToString()));
+            assertNotNull(mappedSlice);
+            EscfColumn sliceResult = EscfColumn.from(mappedSlice);
+            for (int i = 0; i < count; i++) {
+                if (expected[from + i] == null) {
+                    assertTrue(sliceResult.isAbsent(i));
+                } else {
+                    assertEquals("s:" + expected[from + i], sliceResult.getBinaryValue(i).utf8ToString());
+                }
+            }
+        }
+    }
+
+    public void testMapDictionary_plainColumnIsNotMapped() {
+        EscfColumnBuilder b = new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, BytesRefRecycler.NON_RECYCLING_INSTANCE);
+        b.setString(0, new BytesRef("a"));
+        b.setString(1, new BytesRef("a"));
+        try (EscfColumnData data = b.finish(2)) {
+            assertNull(EscfColumnTransforms.mapDictionary(EscfColumn.from(data), v -> { throw new AssertionError("must not be called"); }));
+        }
+    }
 }

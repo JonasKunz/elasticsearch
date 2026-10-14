@@ -44,6 +44,7 @@ import org.elasticsearch.escf.EscfColumnData;
 import org.elasticsearch.escf.EscfColumnKind;
 import org.elasticsearch.escf.EscfColumnTransforms;
 import org.elasticsearch.escf.LuceneBinaryColumn;
+import org.elasticsearch.escf.LuceneDictionaryColumn;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.analysis.NamedAnalyzer;
 import org.elasticsearch.index.fielddata.FieldDataContext;
@@ -460,6 +461,9 @@ public class VersionStringFieldMapper extends FieldMapper {
     @Override
     protected void doMapColumnBatch(BatchMappingContext ctx, EscfColumn source) {
         final int docCount = ctx.docCount();
+        if (mapDictionaryColumnBatch(ctx, source)) {
+            return;
+        }
         // retainValues=false: every value is encoded within one loop iteration, before the cursor advances.
         final ObjectTupleCursor<BytesRef> cursor = EscfColumnTransforms.utf8Cursor(source, false);
         // TODO: make the batch supply a recycler to wire up recycling instead of NON_RECYCLING_INSTANCE.
@@ -490,6 +494,33 @@ public class VersionStringFieldMapper extends FieldMapper {
                 ctx.addColumn(LuceneBinaryColumn.of(data, fieldType().name(), SortedSetDocValuesField.TYPE));
             }
         }
+    }
+
+    /**
+     * The columnar path for a dictionary-encoded source: each distinct version string is encoded once and the encoded dictionary is
+     * handed to Lucene with the source's ordinals, so a column that repeats a few versions over many rows costs a few encodings
+     * instead of one per row. Returns {@code false} when {@code source} is not dictionary-encoded (or has no value), leaving the
+     * row-wise path to handle it.
+     */
+    private boolean mapDictionaryColumnBatch(BatchMappingContext ctx, EscfColumn source) {
+        final EscfColumnData encoded = EscfColumnTransforms.mapDictionary(source, VersionStringFieldMapper::encodeVersionValue);
+        if (encoded == null) {
+            return false;
+        }
+        ctx.addResource(encoded);
+        final EscfColumn column = EscfColumn.from(encoded);
+        final LuceneDictionaryColumn terms = LuceneDictionaryColumn.of(column, fieldType().name(), fieldType);
+        final LuceneDictionaryColumn docValues = LuceneDictionaryColumn.of(column, fieldType().name(), SortedSetDocValuesField.TYPE);
+        if (terms != null && docValues != null) {
+            ctx.addColumn(terms);
+            ctx.addColumn(docValues);
+        } else {
+            // Lucene cannot take this dictionary (an encoded value is too large for a term): expand to one value per row.
+            final EscfColumnData plain = column.columnData();
+            ctx.addColumn(LuceneBinaryColumn.of(plain, fieldType().name(), fieldType));
+            ctx.addColumn(LuceneBinaryColumn.of(plain, fieldType().name(), SortedSetDocValuesField.TYPE));
+        }
+        return true;
     }
 
     @Override
