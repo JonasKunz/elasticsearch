@@ -419,15 +419,15 @@ public abstract class AbstractColumnarMapperCompatibilityTestCase extends Mapper
     }
 
     /**
-     * Whether the source columns are run-length encoded, as the OTLP metrics path produces them. A subclass returns {@code true} to run
-     * all of its scenarios against that column layout instead of the plain one.
+     * Whether the source columns are encoded with dictionary-encoded STRING columns, as the OTLP metrics path does. A subclass
+     * returns {@code true} to run all of its scenarios against that column layout instead of the plain one.
      */
-    protected boolean runLengthEncoded() {
+    protected boolean dictionaryStrings() {
         return false;
     }
 
     private EscfBatch encode(List<BytesReference> sources, SourceEncoder encoder) throws IOException {
-        try (EscfEncoder escfEncoder = new EscfEncoder(BytesRefRecycler.NON_RECYCLING_INSTANCE, encoder.allowSimd, runLengthEncoded())) {
+        try (EscfEncoder escfEncoder = new EscfEncoder(BytesRefRecycler.NON_RECYCLING_INSTANCE, encoder.allowSimd, dictionaryStrings())) {
             for (BytesReference source : sources) {
                 escfEncoder.addDocument(source, XContentType.JSON);
             }

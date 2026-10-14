@@ -27,8 +27,8 @@ import java.util.List;
  *
  * <ul>
  *   <li><b>Blocks.</b> All data points of one scope of one resource share the resource and scope fields. {@link #beginBlock} declares
- *   how many rows they span and the {@code block*Field} methods then write such a field once for all of them. The columns are
- *   run-length encoded, so that is one entry per block.</li>
+ *   how many rows they span and the {@code block*Field} methods then write such a field once for all of them. On a dictionary-encoded
+ *   string column that costs a fill of the ordinal array rather than a dictionary lookup per row.</li>
  *   <li><b>No per-row absent filling.</b> A data point holds one metric value out of potentially hundreds of metric columns, so
  *   writing an absent for every other column in every row would dominate. Columns are written positionally instead and the gaps
  *   between written rows are filled in bulk, lazily, by the column builders.</li>
@@ -44,6 +44,7 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
 
     private final SourceSchema schema = new SourceSchema();
     private final Recycler<BytesRef> recycler;
+    private final boolean dictionaryStrings;
     private final List<EscfColumnBuilder> builders = new ArrayList<>(INITIAL_CAPACITY);
     /** Per leaf: {@code 1 + the row it was last written in}, to reject duplicate fields within a row. */
     private int[] writtenInRow = new int[INITIAL_CAPACITY];
@@ -57,13 +58,14 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
     /** The first row of the open block. */
     private int blockStart;
 
-    /** Creates a builder without buffer recycling, for tests. */
+    /** Creates a builder with dictionary-encoded string columns and no buffer recycling, for tests. */
     public OtlpMetricsBatchBuilder() {
-        this(BytesRefRecycler.NON_RECYCLING_INSTANCE);
+        this(BytesRefRecycler.NON_RECYCLING_INSTANCE, true);
     }
 
-    public OtlpMetricsBatchBuilder(Recycler<BytesRef> recycler) {
+    public OtlpMetricsBatchBuilder(Recycler<BytesRef> recycler, boolean dictionaryStrings) {
         this.recycler = recycler;
+        this.dictionaryStrings = dictionaryStrings;
     }
 
     /** Starts the next row. */
@@ -195,7 +197,7 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
         writtenInRow[colIdx] = docCount + 1;
         // Rows before the first one a column is written in are absent: the builder fills them in lazily.
         while (builders.size() <= colIdx) {
-            builders.add(new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler, true));
+            builders.add(new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler, dictionaryStrings));
         }
         return builders.get(colIdx);
     }

@@ -132,12 +132,11 @@ public final class EscfBatchScatterer implements Releasable {
         int partitionCount = destCounts.length;
         for (int p = 0; p < partitionCount; p++) {
             if (destCounts[p] > 0) {
-                // A run-length-encoded source stays run-length-encoded in every partition: rows that were adjacent in the source and
-                // go to the same partition are still adjacent in it, so most runs survive.
+                // A dictionary-encoded source stays dictionary-encoded in every partition (each gets its own dictionary).
                 EscfColumnBuilder b = new EscfColumnBuilder(
                     EscfColumnBuilder.CollisionPolicy.SPLIT,
                     recycler,
-                    col instanceof EscfRleColumn
+                    col instanceof EscfDictStringColumn
                 );
                 applyHint(b, col);
                 builders[p] = b;

@@ -38,14 +38,11 @@ import java.util.List;
  * [Column Data]   per leaf, present fields concatenated: [validity_bitset] [type_vector] [offsets] [data]
  * </pre>
  * {@code present_flags} bit 0 = Arrow-style validity bitset (bit set = present), bit 1 = type vector,
- * bit 2 = offsets, bit 3 = run-length encoded; the data field is always present. {@code base_offset} is relative to
- * {@code data_offset}.
+ * bit 2 = offsets, bit 3 = dictionary; the data field is always present. {@code base_offset} is relative to {@code data_offset}.
  *
- * <p>A column with the run-length bit set is a run-length-encoded wrapper (see {@link EscfRleColumn}) around a LONG, DOUBLE, BOOL,
- * STRING or BINARY column. Its validity, offsets and data fields describe the column of the <em>runs</em>, which has
- * {@code run_count} documents rather than {@code doc_count}, and its data field is
- * {@code run_count(i32) | run_data | repetitions}: the data field of the column of runs, followed by one unsigned byte per run
- * holding the run's length minus one.
+ * <p>A STRING column with the dictionary bit set is dictionary-encoded: its offsets field holds {@code dictionary_size + 1}
+ * offsets (not one per document) and its data field is {@code dictionary_values | ordinals}, where the ordinals are one
+ * unsigned 16-bit little-endian value per document.
  */
 final class EscfBatchCodec {
 
@@ -59,7 +56,7 @@ final class EscfBatchCodec {
     private static final int FLAG_VALIDITY = 0x1;
     private static final int FLAG_TYPE_VECTOR = 0x2;
     private static final int FLAG_OFFSETS = 0x4;
-    private static final int FLAG_RLE = 0x8;
+    private static final int FLAG_DICTIONARY = 0x8;
 
     private EscfBatchCodec() {}
 
@@ -100,23 +97,10 @@ final class EscfBatchCodec {
             int offsetsLen = data.getIntLE(entryBase + 14);
             int dataLen = data.getIntLE(entryBase + 18);
 
-            boolean rle = (flags & FLAG_RLE) != 0;
-            // The sections describe the column of the runs when run-length encoded, which has run_count documents.
-            int n = docCount;
-            if (rle) {
-                if (kind == EscfColumnKind.ARRAY || kind == EscfColumnKind.UNION) {
-                    throw new IllegalArgumentException("a " + EscfColumnKind.name(kind) + " column cannot be run-length encoded");
-                }
-                n = data.getIntLE(base + absentLen + typeVecLen + offsetsLen);
-                if (n < 0 || n > docCount || dataLen < 4 + n) {
-                    throw new IllegalArgumentException("corrupt run-length-encoded column: [" + n + "] runs for [" + docCount + "] docs");
-                }
-            }
-
             int pos = base;
             FixedBitSet validity = null;
             if ((flags & FLAG_VALIDITY) != 0) {
-                validity = bytesToFixedBitSet(data, pos, n);
+                validity = bytesToFixedBitSet(data, pos, docCount);
                 pos += absentLen;
             }
             BytesRef typeVector = null;
@@ -124,46 +108,38 @@ final class EscfBatchCodec {
                 typeVector = new BytesRef(bytesToByteArray(data, pos, typeVecLen));
                 pos += typeVecLen;
             }
+            boolean dictionary = (flags & FLAG_DICTIONARY) != 0;
+            if (dictionary && kind != EscfColumnKind.STRING) {
+                throw new IllegalArgumentException("only STRING columns can be dictionary-encoded, got " + EscfColumnKind.name(kind));
+            }
             int[] offsets = null;
             if ((flags & FLAG_OFFSETS) != 0) {
-                offsets = bytesToOffsets(data, pos, n);
+                // a dictionary column stores one offset per dictionary entry rather than one per document
+                offsets = bytesToOffsets(data, pos, dictionary ? offsetsLen / 4 - 1 : docCount);
                 pos += offsetsLen;
-            }
-            byte[] repetitions = null;
-            if (rle) {
-                pos += 4; // run_count
-                dataLen -= 4 + n;
-                repetitions = bytesToByteArray(data, pos + dataLen, n);
             }
             // For BOOL the data field carries the value bitset; ARRAY carries a nested child column;
             // every other kind keeps its payload as a byte slice.
-            EscfColumnData column = switch (kind) {
-                case EscfColumnKind.BOOL -> EscfColumnData.ofBool(n, validity, bytesToFixedBitSet(data, pos, n));
-                case EscfColumnKind.ARRAY -> EscfColumnData.ofArray(n, validity, offsets, decodeArrayChild(data, pos, dataLen, offsets[n]));
-                case EscfColumnKind.UNION -> EscfColumnData.ofUnion(n, validity, typeVector, offsets, data.slice(pos, dataLen));
-                case EscfColumnKind.STRING, EscfColumnKind.BINARY -> EscfColumnData.ofVarWidth(
-                    kind,
-                    n,
+            columns[c] = switch (kind) {
+                case EscfColumnKind.BOOL -> EscfColumnData.ofBool(docCount, validity, bytesToFixedBitSet(data, pos, docCount));
+                case EscfColumnKind.ARRAY -> EscfColumnData.ofArray(
+                    docCount,
                     validity,
                     offsets,
+                    decodeArrayChild(data, pos, dataLen, offsets[docCount])
+                );
+                case EscfColumnKind.UNION -> EscfColumnData.ofUnion(docCount, validity, typeVector, offsets, data.slice(pos, dataLen));
+                case EscfColumnKind.STRING, EscfColumnKind.BINARY -> dictionary
+                    ? decodeDictString(data, pos, dataLen, docCount, validity, offsets)
+                    : EscfColumnData.ofVarWidth(kind, docCount, validity, offsets, data.slice(pos, dataLen));
+                case EscfColumnKind.LONG, EscfColumnKind.DOUBLE -> EscfColumnData.ofFixed64(
+                    kind,
+                    docCount,
+                    validity,
                     data.slice(pos, dataLen)
                 );
-                case EscfColumnKind.LONG, EscfColumnKind.DOUBLE -> EscfColumnData.ofFixed64(kind, n, validity, data.slice(pos, dataLen));
                 default -> throw new IllegalStateException("Unknown ESCF column kind: " + EscfColumnKind.name(kind));
             };
-            if (rle) {
-                long rows = 0;
-                for (byte repetition : repetitions) {
-                    rows += (repetition & 0xFF) + 1;
-                }
-                if (rows != docCount) {
-                    throw new IllegalArgumentException(
-                        "corrupt run-length-encoded column: runs cover [" + rows + "] docs, expected [" + docCount + "]"
-                    );
-                }
-                column = EscfColumnData.ofRle(docCount, column, repetitions);
-            }
-            columns[c] = column;
         }
         return new EscfBatch(schema, docCount, columns, data, releasable);
     }
@@ -183,11 +159,8 @@ final class EscfBatchCodec {
         BytesReference[] offsetsPart = new BytesReference[colCount];
         BytesReference[] dataPart = new BytesReference[colCount];
         for (int c = 0; c < colCount; c++) {
-            EscfColumnData outer = columns[c];
-            // A run-length-encoded column is stored as its column of runs plus the repetitions.
-            EscfColumnData col = outer.isRunLengthEncoded() ? outer.child() : outer;
-            int n = col.docCount();
-            absentPart[c] = col.validity() != null ? bitsetToRef(col.validity(), n) : null;
+            EscfColumnData col = columns[c];
+            absentPart[c] = col.validity() != null ? bitsetToRef(col.validity(), docCount) : null;
             typeVecPart[c] = col.typeVector() != null
                 ? new BytesArray(col.typeVector().bytes, col.typeVector().offset, col.typeVector().length)
                 : null;
@@ -196,18 +169,13 @@ final class EscfBatchCodec {
             // child_kind(1) | child_values bytes here (the only place ESCF serializes an ARRAY's child);
             // every other kind already has a byte payload.
             if (col.kind() == EscfColumnKind.BOOL) {
-                dataPart[c] = bitsetToRef(col.values(), n);
+                dataPart[c] = bitsetToRef(col.values(), docCount);
             } else if (col.kind() == EscfColumnKind.ARRAY) {
                 dataPart[c] = encodeArrayChild(col.child());
+            } else if (col.isDictionaryEncoded()) {
+                dataPart[c] = CompositeBytesReference.of(col.data(), ordinalsToRef(col.ordinals(), docCount));
             } else {
                 dataPart[c] = col.data();
-            }
-            if (outer.isRunLengthEncoded()) {
-                dataPart[c] = CompositeBytesReference.of(
-                    intArrayToRef(new int[] { n }),
-                    dataPart[c],
-                    new BytesArray(outer.repetitions(), 0, n)
-                );
             }
         }
 
@@ -230,8 +198,8 @@ final class EscfBatchCodec {
                 cumDataOffset += offsetsPart[c].length();
             }
             cumDataOffset += dataPart[c].length();
-            if (columns[c].isRunLengthEncoded()) {
-                f |= FLAG_RLE;
+            if (columns[c].isDictionaryEncoded()) {
+                f |= FLAG_DICTIONARY;
             }
             flags[c] = f;
         }
@@ -372,6 +340,54 @@ final class EscfBatchCodec {
             }
         }
         return new BytesArray(out);
+    }
+
+    /** Encodes {@code count} ordinals as unsigned 16-bit little-endian values. */
+    static BytesReference ordinalsToRef(char[] ordinals, int count) {
+        byte[] out = new byte[count * 2];
+        for (int i = 0; i < count; i++) {
+            writeShortLE(out, i * 2, ordinals[i]);
+        }
+        return new BytesArray(out);
+    }
+
+    /**
+     * Parses a dictionary-encoded STRING column from its {@code dictionary_values | ordinals} data field. The dictionary
+     * offsets have already been read; the ordinals follow the last dictionary byte.
+     */
+    private static EscfColumnData decodeDictString(
+        BytesReference data,
+        int pos,
+        int dataLen,
+        int docCount,
+        FixedBitSet validity,
+        int[] dictOffsets
+    ) {
+        int dictionarySize = dictOffsets.length - 1;
+        int dictLen = dictOffsets[dictionarySize];
+        if (dictionarySize > EscfColumnData.MAX_DICTIONARY_SIZE || dictLen < 0 || dictLen + 2L * docCount != dataLen) {
+            throw new IllegalArgumentException(
+                "corrupt dictionary column: dictionary size ["
+                    + dictionarySize
+                    + "], dictionary bytes ["
+                    + dictLen
+                    + "], data ["
+                    + dataLen
+                    + "]"
+            );
+        }
+        char[] ordinals = new char[docCount];
+        BytesRef ordinalBytes = data.slice(pos + dictLen, 2 * docCount).toBytesRef();
+        for (int i = 0; i < docCount; i++) {
+            int at = ordinalBytes.offset + i * 2;
+            ordinals[i] = (char) ((ordinalBytes.bytes[at] & 0xFF) | ((ordinalBytes.bytes[at + 1] & 0xFF) << 8));
+            if (ordinals[i] >= dictionarySize && (validity == null || validity.get(i))) {
+                throw new IllegalArgumentException(
+                    "corrupt dictionary column: ordinal [" + (int) ordinals[i] + "] of document [" + i + "] is out of range"
+                );
+            }
+        }
+        return EscfColumnData.ofDictString(docCount, validity, dictOffsets, data.slice(pos, dictLen), ordinals);
     }
 
     static BytesReference intArrayToRef(int[] values) {

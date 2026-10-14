@@ -65,8 +65,8 @@ import org.elasticsearch.escf.EscfColumnData;
 import org.elasticsearch.escf.EscfColumnKind;
 import org.elasticsearch.escf.EscfColumnTransforms;
 import org.elasticsearch.escf.LuceneBinaryColumn;
+import org.elasticsearch.escf.LuceneDictionaryColumn;
 import org.elasticsearch.escf.LuceneLongColumn;
-import org.elasticsearch.escf.LuceneRleDictionaryColumn;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.IndexSortConfig;
@@ -2226,12 +2226,11 @@ public final class KeywordFieldMapper extends FieldMapper {
             // For binary doc values the terms and dv columns may share one serialization (emitSharedColumn).
             if (valuesProduced) {
                 if (emitSharedColumn) {
-                    // A run-length-encoded source (and nothing dropped from it) goes to Lucene as one dictionary entry per run plus
-                    // ordinals, so it is never expanded to one value per row. Only a binary doc values column below needs the
-                    // expanded form.
+                    // A dictionary-encoded source (and nothing dropped from it) goes to Lucene as its dictionary plus ordinals, so
+                    // it is never expanded to one value per row. Only a binary doc values column below needs the expanded form.
                     final boolean binaryDvs = emitDvs && columnarPayload == false && sortedSetDvs == false;
-                    final LuceneRleDictionaryColumn dictionaryTerms = values == null && (emitTerms || sortedSetDvs)
-                        ? LuceneRleDictionaryColumn.of(source, fieldType().name(), fieldType)
+                    final LuceneDictionaryColumn dictionaryTerms = values == null && (emitTerms || sortedSetDvs)
+                        ? LuceneDictionaryColumn.of(source, fieldType().name(), fieldType)
                         : null;
                     final boolean plainTerms = (emitTerms || sortedSetDvs) && dictionaryTerms == null;
                     final EscfColumnData data = values != null

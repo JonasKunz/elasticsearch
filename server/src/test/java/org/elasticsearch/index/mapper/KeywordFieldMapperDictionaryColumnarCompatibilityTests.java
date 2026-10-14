@@ -10,13 +10,13 @@
 package org.elasticsearch.index.mapper;
 
 /**
- * Runs every scenario of {@link KeywordFieldMapperColumnarCompatibilityTests} with run-length encoded source columns, the layout the
- * OTLP metrics path produces, so {@link KeywordFieldMapper#mapColumnBatch} is checked against the row path on that layout too.
+ * Runs every scenario of {@link KeywordFieldMapperColumnarCompatibilityTests} with the source STRING columns dictionary-encoded, the layout
+ * the OTLP metrics path produces, so {@link KeywordFieldMapper#mapColumnBatch} is checked against the row path on that layout too.
  */
-public class KeywordFieldMapperRleColumnarCompatibilityTests extends KeywordFieldMapperColumnarCompatibilityTests {
+public class KeywordFieldMapperDictionaryColumnarCompatibilityTests extends KeywordFieldMapperColumnarCompatibilityTests {
 
     @Override
-    protected boolean runLengthEncoded() {
+    protected boolean dictionaryStrings() {
         return true;
     }
 }

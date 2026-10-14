@@ -12,6 +12,8 @@ package org.elasticsearch.escf;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.StringHelper;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.io.stream.RecyclerBytesStreamOutput;
 import org.elasticsearch.common.recycler.Recycler;
@@ -58,8 +60,8 @@ public final class EscfColumnBuilder implements Releasable {
 
     private final CollisionPolicy policy;
     private final Recycler<BytesRef> recycler;
-    /** Whether scalar columns are built run-length encoded (see {@link RleBuilder}). */
-    private final boolean runLengthEncoding;
+    /** Whether STRING columns are built dictionary-encoded (see {@link DictStringBuilder}). */
+    private final boolean dictionaryStrings;
     private TypedBuilder current;
     private int leadingAbsents;
     /** Row index of the last written value (not an absent gap); {@code -1} before any value. */
@@ -79,15 +81,14 @@ public final class EscfColumnBuilder implements Releasable {
     }
 
     /**
-     * @param runLengthEncoding build LONG, DOUBLE, BOOL, STRING and BINARY columns as {@link EscfRleColumn}s, storing a value that
-     *                          repeats in consecutive rows once with a repetition count. Costs a comparison with the previous value
-     *                          per row written, and a repetition byte per run; worthwhile for columns whose values repeat in long
-     *                          stretches. A column that is promoted to a union or an array is expanded and ends up in the plain layout.
+     * @param dictionaryStrings build STRING columns dictionary-encoded ({@link EscfDictStringColumn}) instead of plain. Pays a hash
+     *                          lookup per value to store repeated values once; a column that turns out to have more than
+     *                          {@link EscfColumnData#MAX_DICTIONARY_SIZE} distinct values silently reverts to the plain layout.
      */
-    public EscfColumnBuilder(CollisionPolicy policy, Recycler<BytesRef> recycler, boolean runLengthEncoding) {
+    public EscfColumnBuilder(CollisionPolicy policy, Recycler<BytesRef> recycler, boolean dictionaryStrings) {
         this.policy = policy;
         this.recycler = recycler;
-        this.runLengthEncoding = runLengthEncoding;
+        this.dictionaryStrings = dictionaryStrings;
     }
 
     /** Returns {@code true} if no present value has been recorded (absents/hints don't count); callers may skip {@link #finish}. */
@@ -283,7 +284,7 @@ public final class EscfColumnBuilder implements Releasable {
         assert row > lastWrittenRow : nonDecreasing(row);
         fillGapTo(row);
         if (current == null) {
-            TypedBuilder b = newScalarBuilder(EscfColumnKind.BOOL);
+            BoolBuilder b = new BoolBuilder();
             backfillLeadingAbsents(b);
             current = b;
             b.addBoolean(value);
@@ -310,7 +311,7 @@ public final class EscfColumnBuilder implements Releasable {
 
     /**
      * Writes the same string into rows {@code [row, row + count)}. Equivalent to {@code count} calls of
-     * {@link #setString(int, byte[], int, int)}, but for column layouts that can repeat a value in bulk it avoids the per-row work.
+     * {@link #setString(int, byte[], int, int)}, but for a dictionary-encoded column the repeats cost one fill of the ordinal array.
      */
     public void setStringRepeated(int row, byte[] bytes, int offset, int length, int count) {
         setString(row, bytes, offset, length);
@@ -638,15 +639,9 @@ public final class EscfColumnBuilder implements Releasable {
     }
 
     private TypedBuilder newScalarWithBackfill(byte kind) {
-        TypedBuilder b = newScalarBuilder(kind);
+        TypedBuilder b = newScalar(kind, recycler, dictionaryStrings);
         backfillLeadingAbsents(b);
         return b;
-    }
-
-    /** A builder for a scalar column of {@code kind}, run-length encoding it if so configured. */
-    private TypedBuilder newScalarBuilder(byte kind) {
-        TypedBuilder plain = newScalar(kind, recycler);
-        return runLengthEncoding ? new RleBuilder(plain, recycler) : plain;
     }
 
     private static void writeScalar(TypedBuilder b, byte kind, long longBits, double dbl, byte[] bytes, int off, int len) {
@@ -855,11 +850,12 @@ public final class EscfColumnBuilder implements Releasable {
         return "rows must be non-decreasing: " + row + " is not greater than the last written row " + lastWrittenRow;
     }
 
-    private static TypedBuilder newScalar(byte kind, Recycler<BytesRef> recycler) {
+    private static TypedBuilder newScalar(byte kind, Recycler<BytesRef> recycler, boolean dictionaryStrings) {
         return switch (kind) {
             case EscfColumnKind.LONG, EscfColumnKind.DOUBLE -> new FixedNumericBuilder(kind, recycler);
             case EscfColumnKind.BOOL -> new BoolBuilder();
-            case EscfColumnKind.STRING, EscfColumnKind.BINARY -> new VarBuilder(kind, recycler);
+            case EscfColumnKind.STRING -> dictionaryStrings ? new DictStringBuilder(recycler) : new VarBuilder(kind, recycler);
+            case EscfColumnKind.BINARY -> new VarBuilder(kind, recycler);
             default -> throw new IllegalArgumentException("No scalar builder for kind " + EscfColumnKind.name(kind));
         };
     }
@@ -913,6 +909,7 @@ public final class EscfColumnBuilder implements Releasable {
         /** Near-free promotion to a union (adopts the value buffer where the layout allows). */
         UnionBuilder promote(Recycler<BytesRef> recycler);
 
+        /** Promotion to a columnar ARRAY (scalar buffer becomes the array child); only scalar builders support it. */
         /**
          * Appends {@code times} more copies of the value of the last row, if that row holds a present value and this layout can
          * repeat it cheaply. Returns {@code false}, having changed nothing, when it cannot; the caller then writes the rows one by one.
@@ -921,7 +918,6 @@ public final class EscfColumnBuilder implements Releasable {
             return false;
         }
 
-        /** Promotion to a columnar ARRAY (scalar buffer becomes the array child); only scalar builders support it. */
         default ArrayBuilder promoteToArray(Recycler<BytesRef> recycler) {
             throw new AssertionError("column kind " + EscfColumnKind.name(kind()) + " cannot promote to array");
         }
@@ -1023,225 +1019,6 @@ public final class EscfColumnBuilder implements Releasable {
 
         private AssertionError unsupported(String type) {
             return new AssertionError("column kind " + EscfColumnKind.name(kind()) + " cannot accept a " + type + " value");
-        }
-    }
-
-    /**
-     * Wraps a scalar builder to run-length encode what is written to it: consecutive equal values (and consecutive absent rows) are
-     * stored once in the wrapped builder, and {@link #repetitions} records how many rows each stored entry stands for, as
-     * {@code rows - 1} in an unsigned byte. More than {@link EscfColumnData#MAX_RUN_LENGTH} equal rows take several entries.
-     *
-     * <p>Only the last run can grow, so each write is compared with the last value only. Promoting to a union or an array expands
-     * the runs into a plain builder first.
-     */
-    private static final class RleBuilder implements TypedBuilder {
-        private static final int MAX_REPETITIONS = EscfColumnData.MAX_RUN_LENGTH - 1;
-
-        private final TypedBuilder runs;
-        private final Recycler<BytesRef> recycler;
-        private byte[] repetitions = new byte[16];
-        private int runCount;
-        private int rows;
-
-        /** Whether the last run holds a value, as opposed to being a run of absent rows; {@code false} before any run. */
-        private boolean lastPresent;
-        // the value of the last run, in the representation of the wrapped builder's kind
-        private long lastBits;
-        private boolean lastBool;
-        private byte[] lastBytes = EMPTY_BYTES;
-        private int lastLength;
-
-        RleBuilder(TypedBuilder runs, Recycler<BytesRef> recycler) {
-            this.runs = runs;
-            this.recycler = recycler;
-        }
-
-        @Override
-        public byte kind() {
-            return runs.kind();
-        }
-
-        @Override
-        public int rowsConsumed() {
-            return rows;
-        }
-
-        /** Makes the last run one row longer if it has room. */
-        private boolean growLast() {
-            if (runCount == 0 || (repetitions[runCount - 1] & 0xFF) == MAX_REPETITIONS) {
-                return false;
-            }
-            repetitions[runCount - 1]++;
-            rows++;
-            return true;
-        }
-
-        /** Records a new run of {@code length} rows whose entry has just been added to the wrapped builder. */
-        private void newRun(int length) {
-            repetitions = ArrayUtil.grow(repetitions, runCount + 1);
-            repetitions[runCount++] = (byte) (length - 1);
-            rows += length;
-        }
-
-        @Override
-        public void addLong(long value) {
-            if (lastPresent && lastBits == value && growLast()) {
-                return;
-            }
-            runs.addLong(value);
-            newRun(1);
-            lastPresent = true;
-            lastBits = value;
-        }
-
-        @Override
-        public void addDouble(double value) {
-            long bits = Double.doubleToRawLongBits(value);
-            if (lastPresent && lastBits == bits && growLast()) {
-                return;
-            }
-            runs.addDouble(value);
-            newRun(1);
-            lastPresent = true;
-            lastBits = bits;
-        }
-
-        @Override
-        public void addBoolean(boolean value) {
-            if (lastPresent && lastBool == value && growLast()) {
-                return;
-            }
-            runs.addBoolean(value);
-            newRun(1);
-            lastPresent = true;
-            lastBool = value;
-        }
-
-        @Override
-        public void addBytes(byte kind, byte[] bytes, int offset, int length) {
-            if (lastPresent && lastLength == length && Arrays.equals(lastBytes, 0, length, bytes, offset, offset + length) && growLast()) {
-                return;
-            }
-            runs.addBytes(kind, bytes, offset, length);
-            newRun(1);
-            lastPresent = true;
-            lastBytes = ArrayUtil.grow(lastBytes, length);
-            System.arraycopy(bytes, offset, lastBytes, 0, length);
-            lastLength = length;
-        }
-
-        @Override
-        public void addNull() {
-            throw new AssertionError("column kind " + EscfColumnKind.name(kind()) + " cannot accept a null value");
-        }
-
-        @Override
-        public void addAbsent() {
-            if (lastPresent == false && growLast()) {
-                return;
-            }
-            runs.addAbsent();
-            newRun(1);
-            lastPresent = false;
-        }
-
-        @Override
-        public void addAbsents(int n) {
-            while (n > 0) {
-                if (lastPresent == false && runCount > 0) {
-                    int take = Math.min(MAX_REPETITIONS - (repetitions[runCount - 1] & 0xFF), n);
-                    repetitions[runCount - 1] += (byte) take;
-                    rows += take;
-                    n -= take;
-                    if (n == 0) {
-                        return;
-                    }
-                }
-                int length = Math.min(EscfColumnData.MAX_RUN_LENGTH, n);
-                runs.addAbsent();
-                newRun(length);
-                lastPresent = false;
-                n -= length;
-            }
-        }
-
-        @Override
-        public boolean repeatLast(int times) {
-            if (lastPresent == false) {
-                return false;
-            }
-            int remaining = times;
-            int take = Math.min(MAX_REPETITIONS - (repetitions[runCount - 1] & 0xFF), remaining);
-            repetitions[runCount - 1] += (byte) take;
-            rows += take;
-            remaining -= take;
-            while (remaining > 0) {
-                // the last run is full: start another run of the same value
-                switch (kind()) {
-                    case EscfColumnKind.LONG, EscfColumnKind.DOUBLE -> runs.addLong(lastBits);
-                    case EscfColumnKind.BOOL -> runs.addBoolean(lastBool);
-                    case EscfColumnKind.STRING, EscfColumnKind.BINARY -> runs.addBytes(kind(), lastBytes, 0, lastLength);
-                    default -> throw new AssertionError("not a scalar kind: " + EscfColumnKind.name(kind()));
-                }
-                int length = Math.min(EscfColumnData.MAX_RUN_LENGTH, remaining);
-                newRun(length);
-                remaining -= length;
-            }
-            return true;
-        }
-
-        @Override
-        public UnionBuilder promote(Recycler<BytesRef> recycler) {
-            return expand().promote(recycler);
-        }
-
-        @Override
-        public ArrayBuilder promoteToArray(Recycler<BytesRef> recycler) {
-            return expand().promoteToArray(recycler);
-        }
-
-        /** Replays the runs, one entry per row, into a plain builder of the same kind. Leaves this builder unusable. */
-        private TypedBuilder expand() {
-            EscfColumnData runData = runs.finish(runCount);
-            try {
-                EscfColumn runColumn = EscfColumn.from(runData);
-                TypedBuilder plain = newScalar(kind(), recycler);
-                for (int run = 0; run < runCount; run++) {
-                    int length = (repetitions[run] & 0xFF) + 1;
-                    if (runColumn.isAbsent(run)) {
-                        plain.addAbsents(length);
-                        continue;
-                    }
-                    for (int i = 0; i < length; i++) {
-                        switch (kind()) {
-                            case EscfColumnKind.LONG, EscfColumnKind.DOUBLE -> plain.addLong(
-                                ((AbstractFixed64Column) runColumn).rawLong(run)
-                            );
-                            case EscfColumnKind.BOOL -> plain.addBoolean(runColumn.getBooleanValue(run));
-                            case EscfColumnKind.STRING, EscfColumnKind.BINARY -> {
-                                BytesRef value = runColumn.getBinaryValue(run);
-                                plain.addBytes(kind(), value.bytes, value.offset, value.length);
-                            }
-                            default -> throw new AssertionError("not a scalar kind: " + EscfColumnKind.name(kind()));
-                        }
-                    }
-                }
-                return plain;
-            } finally {
-                runData.close();
-            }
-        }
-
-        @Override
-        public EscfColumnData finish(int docCount) {
-            assert rows == docCount : "builder rows " + rows + " != docCount " + docCount;
-            EscfColumnData runData = runs.finish(runCount);
-            return EscfColumnData.ofRle(docCount, runData, Arrays.copyOf(repetitions, runCount));
-        }
-
-        @Override
-        public void discard() {
-            runs.discard();
         }
     }
 
@@ -1535,6 +1312,203 @@ public final class EscfColumnBuilder implements Releasable {
         @Override
         public void discard() {
             if (data != null) data.close();
+        }
+    }
+
+    /**
+     * STRING, dictionary-encoded: each distinct value is stored once and every row records a 16-bit ordinal into the dictionary.
+     * Absent rows record ordinal {@code 0} and no dictionary entry.
+     *
+     * <p>Values are deduplicated with an open-addressing hash table over the dictionary; consecutive equal values (the common case
+     * for the repeated resource/scope strings of a batch) short-circuit on the previous row's ordinal without hashing. When a
+     * 65,537th distinct value arrives the column can no longer be addressed with 16-bit ordinals, so the builder replays what it has
+     * into a {@link VarBuilder} and delegates to it from then on.
+     */
+    private static final class DictStringBuilder extends BaseBuilder {
+        private final Recycler<BytesRef> recycler;
+        private char[] ordinals = new char[16];
+        private byte[] dictBytes = new byte[256];
+        /** Entry {@code i} spans {@code [dictOffsets[i], dictOffsets[i + 1])} of {@link #dictBytes}. */
+        private int[] dictOffsets = new int[17];
+        private int[] dictHashes = new int[16];
+        private int dictSize;
+        /** Open-addressing table of {@code ordinal + 1} (0 = empty slot), always a power-of-two long and at most half full. */
+        private int[] table = new int[32];
+        private int lastOrdinal = -1;
+        /** Non-null once the dictionary overflowed; every call is then delegated here. */
+        private VarBuilder plain;
+
+        DictStringBuilder(Recycler<BytesRef> recycler) {
+            this.recycler = recycler;
+        }
+
+        @Override
+        public byte kind() {
+            return EscfColumnKind.STRING;
+        }
+
+        @Override
+        public int rowsConsumed() {
+            return plain != null ? plain.rowsConsumed() : count;
+        }
+
+        @Override
+        public void addBytes(byte kind, byte[] bytes, int offset, int length) {
+            assert kind == EscfColumnKind.STRING : "DictStringBuilder given " + EscfColumnKind.name(kind);
+            if (plain != null) {
+                plain.addBytes(kind, bytes, offset, length);
+                return;
+            }
+            int ordinal = ordinalOf(bytes, offset, length);
+            if (ordinal < 0) {
+                fallBackToPlain();
+                plain.addBytes(kind, bytes, offset, length);
+                return;
+            }
+            ordinals = ArrayUtil.grow(ordinals, count + 1);
+            ordinals[count] = (char) ordinal;
+            advancePresent();
+        }
+
+        @Override
+        public boolean repeatLast(int times) {
+            if (plain != null || lastPresent == false) {
+                return false;
+            }
+            ordinals = ArrayUtil.grow(ordinals, count + times);
+            Arrays.fill(ordinals, count, count + times, (char) lastOrdinal);
+            bulkAdvancePresent(times);
+            return true;
+        }
+
+        @Override
+        public void addAbsent() {
+            if (plain != null) {
+                plain.addAbsent();
+                return;
+            }
+            ordinals = ArrayUtil.grow(ordinals, count + 1); // slots are zero-initialised, so an absent row keeps ordinal 0
+            advanceAbsent();
+        }
+
+        @Override
+        public void addAbsents(int n) {
+            if (plain != null) {
+                plain.addAbsents(n);
+                return;
+            }
+            ordinals = ArrayUtil.grow(ordinals, count + n);
+            bulkAdvanceAbsent(n);
+        }
+
+        /** The ordinal of the value, adding it to the dictionary if new, or {@code -1} if the dictionary is full. */
+        private int ordinalOf(byte[] bytes, int offset, int length) {
+            if (lastOrdinal >= 0 && entryEquals(lastOrdinal, bytes, offset, length)) {
+                return lastOrdinal;
+            }
+            int hash = StringHelper.murmurhash3_x86_32(bytes, offset, length, 0);
+            int mask = table.length - 1;
+            int slot = hash & mask;
+            for (int entry = table[slot]; entry != 0; entry = table[slot]) {
+                int ordinal = entry - 1;
+                if (dictHashes[ordinal] == hash && entryEquals(ordinal, bytes, offset, length)) {
+                    return lastOrdinal = ordinal;
+                }
+                slot = (slot + 1) & mask;
+            }
+            if (dictSize == EscfColumnData.MAX_DICTIONARY_SIZE) {
+                return -1;
+            }
+            int ordinal = dictSize++;
+            int start = dictOffsets[ordinal];
+            dictBytes = ArrayUtil.grow(dictBytes, start + length);
+            System.arraycopy(bytes, offset, dictBytes, start, length);
+            dictOffsets = ArrayUtil.grow(dictOffsets, ordinal + 2);
+            dictOffsets[ordinal + 1] = start + length;
+            dictHashes = ArrayUtil.grow(dictHashes, ordinal + 1);
+            dictHashes[ordinal] = hash;
+            table[slot] = ordinal + 1;
+            if (dictSize * 2 > table.length) {
+                rehash();
+            }
+            return lastOrdinal = ordinal;
+        }
+
+        private boolean entryEquals(int ordinal, byte[] bytes, int offset, int length) {
+            int start = dictOffsets[ordinal];
+            int end = dictOffsets[ordinal + 1];
+            return end - start == length && Arrays.equals(dictBytes, start, end, bytes, offset, offset + length);
+        }
+
+        private void rehash() {
+            int[] grown = new int[table.length * 2];
+            int mask = grown.length - 1;
+            for (int ordinal = 0; ordinal < dictSize; ordinal++) {
+                int slot = dictHashes[ordinal] & mask;
+                while (grown[slot] != 0) {
+                    slot = (slot + 1) & mask;
+                }
+                grown[slot] = ordinal + 1;
+            }
+            table = grown;
+        }
+
+        /** Replays the rows so far into a plain {@link VarBuilder} and drops the dictionary state. */
+        private void fallBackToPlain() {
+            VarBuilder replay = new VarBuilder(EscfColumnKind.STRING, recycler);
+            for (int row = 0; row < count; row++) {
+                if (isAbsentAt(row)) {
+                    replay.addAbsent();
+                } else {
+                    int ordinal = ordinals[row];
+                    int start = dictOffsets[ordinal];
+                    replay.addBytes(EscfColumnKind.STRING, dictBytes, start, dictOffsets[ordinal + 1] - start);
+                }
+            }
+            plain = replay;
+            ordinals = null;
+            dictBytes = null;
+            dictOffsets = null;
+            dictHashes = null;
+            table = null;
+        }
+
+        @Override
+        public UnionBuilder promote(Recycler<BytesRef> recycler) {
+            if (plain == null) {
+                fallBackToPlain();
+            }
+            return plain.promote(recycler);
+        }
+
+        @Override
+        public ArrayBuilder promoteToArray(Recycler<BytesRef> recycler) {
+            if (plain == null) {
+                fallBackToPlain();
+            }
+            return plain.promoteToArray(recycler);
+        }
+
+        @Override
+        public EscfColumnData finish(int docCount) {
+            if (plain != null) {
+                return plain.finish(docCount);
+            }
+            assert count == docCount : "builder count " + count + " != docCount " + docCount;
+            return EscfColumnData.ofDictString(
+                docCount,
+                validity,
+                Arrays.copyOf(dictOffsets, dictSize + 1),
+                new BytesArray(Arrays.copyOf(dictBytes, dictOffsets[dictSize])),
+                Arrays.copyOf(ordinals, docCount)
+            );
+        }
+
+        @Override
+        public void discard() {
+            if (plain != null) {
+                plain.discard();
+            }
         }
     }
 

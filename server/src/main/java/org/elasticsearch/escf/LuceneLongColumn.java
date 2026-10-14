@@ -121,7 +121,7 @@ public final class LuceneLongColumn extends LongColumn implements LuceneColumn {
     public static LuceneLongColumn of(EscfColumnData data, String name, IndexableFieldType fieldType, LongColumn.NumericKind kind) {
         assert data.kind() == EscfColumnKind.LONG || data.kind() == EscfColumnKind.ARRAY
             : "expected LONG or ARRAY, got " + EscfColumnKind.name(data.kind());
-        EscfColumn col = EscfColumn.plainFrom(data);
+        EscfColumn col = EscfColumn.from(data);
         Density density = (data.kind() == EscfColumnKind.LONG && data.validity() == null) ? Density.DENSE : Density.SPARSE;
         return new LuceneLongColumn(col, name, fieldType, density, kind, null);
     }

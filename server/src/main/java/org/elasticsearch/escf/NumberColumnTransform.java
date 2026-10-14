@@ -322,20 +322,19 @@ public final class NumberColumnTransform {
     ) {
         return switch (type) {
             // Two's-complement longs are already the sortable encoding: zero-copy no-op.
-            // These alias the source column — do NOT register with ownedSink. A run-length-encoded source is handed over in its
-            // plain per-document layout, which is what the Lucene column wrappers read.
-            case LONG -> source.columnData();
+            // These alias the source column — do NOT register with ownedSink.
+            case LONG -> source.toColumnData();
             case BYTE -> {
                 validateLongRange(source, Byte.MIN_VALUE, Byte.MAX_VALUE, "a byte");
-                yield source.columnData();
+                yield source.toColumnData();
             }
             case SHORT -> {
                 validateLongRange(source, Short.MIN_VALUE, Short.MAX_VALUE, "a short");
-                yield source.columnData();
+                yield source.toColumnData();
             }
             case INTEGER -> {
                 validateLongRange(source, Integer.MIN_VALUE, Integer.MAX_VALUE, "an integer");
-                yield source.columnData();
+                yield source.toColumnData();
             }
             // These allocate recycler-backed buffers — register with ownedSink.
             // (float) l and (double) l match the row path: Jackson uses l2f/l2d directly.

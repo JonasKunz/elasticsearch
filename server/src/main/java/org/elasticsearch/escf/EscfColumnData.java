@@ -34,9 +34,11 @@ import org.elasticsearch.sourcebatch.SourceValueType;
  *       Kept native rather than pre-serialized so the "native in-memory" invariant above also holds for
  *       ARRAY; it is only flattened to {@code child_kind(1) | child_values} bytes at the wire boundary in
  *       {@link EscfBatch}.</li>
- *   <li>{@code repetitions} — for a run-length-encoded column only (see {@link #ofRle}): one unsigned byte per run holding
- *       {@code runLength - 1}. Such a column's {@code docCount} is the number of logical documents, its {@code kind} is the kind of
- *       the values, and every other factor is {@code null} except {@code child}, which holds the column of the runs.</li>
+ *   <li>{@code ordinals} — one unsigned 16-bit dictionary ordinal per document; only set for a
+ *       <b>dictionary-encoded STRING</b> column (see {@link #ofDictString}), {@code null} for every other column. In that
+ *       layout {@code offsets} has {@code dictionarySize + 1} entries and {@code data} holds the dictionary's
+ *       concatenated values, instead of the per-document layout described above. The ordinal of an absent
+ *       document is {@code 0} and meaningless.</li>
  * </ul>
  */
 public record EscfColumnData(
@@ -48,11 +50,8 @@ public record EscfColumnData(
     int[] offsets,
     BytesReference data,
     EscfColumnData child,
-    byte[] repetitions
+    char[] ordinals
 ) implements Releasable {
-
-    /** The most documents a single run of a run-length-encoded column can cover: its repetitions are stored in one unsigned byte. */
-    public static final int MAX_RUN_LENGTH = 256;
 
     /**
      * Releases the recycler-backed buffers this column owns: its own {@code data} payload (when it is
@@ -91,38 +90,34 @@ public record EscfColumnData(
     }
 
     /**
-     * A run-length-encoded column: {@code runs} holds one value (or absence) per run of consecutive equal documents, and
-     * {@code repetitions[i] + 1} is the length of run {@code i}, so a run covers between 1 and {@link #MAX_RUN_LENGTH} documents.
-     * A longer stretch of equal documents is stored as several consecutive runs with the same value. {@code runs} must be a LONG,
-     * DOUBLE, BOOL, STRING or BINARY column.
+     * STRING, dictionary-encoded: the distinct values live once in the dictionary and every document holds a 16-bit
+     * ordinal into it. The column's logical kind is still {@link EscfColumnKind#STRING}; only its physical layout differs.
      *
-     * @param docCount    the number of logical documents, the sum of the run lengths
-     * @param repetitions at least {@code runs.docCount()} entries; the first {@code runs.docCount()} are used
+     * <p>Batches of OTLP metrics repeat the same resource, scope and attribute strings on every row, which this layout stores
+     * once per batch instead of once per row. A column with more than {@link #MAX_DICTIONARY_SIZE} distinct values cannot be
+     * represented and stays a plain {@link #ofVarWidth} column.
+     *
+     * @param dictionaryOffsets {@code dictionarySize + 1} byte offsets into {@code dictionaryData}, one value per entry
+     * @param dictionaryData    the concatenated dictionary values
+     * @param ordinals          one ordinal per document, each below {@code dictionarySize} for present documents
      */
-    static EscfColumnData ofRle(int docCount, EscfColumnData runs, byte[] repetitions) {
-        assert runs.isRunLengthEncoded() == false && runs.kind() != EscfColumnKind.ARRAY && runs.kind() != EscfColumnKind.UNION
-            : "cannot run-length-encode a " + EscfColumnKind.name(runs.kind()) + " column";
-        assert repetitions.length >= runs.docCount();
-        assert sumOfRunLengths(repetitions, runs.docCount()) == docCount : "run lengths do not add up to " + docCount;
-        return new EscfColumnData(runs.kind(), docCount, null, null, null, null, null, runs, repetitions);
+    static EscfColumnData ofDictString(
+        int docCount,
+        FixedBitSet validity,
+        int[] dictionaryOffsets,
+        BytesReference dictionaryData,
+        char[] ordinals
+    ) {
+        assert ordinals.length == docCount : "ordinals length " + ordinals.length + " != docCount " + docCount;
+        assert dictionaryOffsets.length - 1 <= MAX_DICTIONARY_SIZE : "dictionary too large: " + (dictionaryOffsets.length - 1);
+        return new EscfColumnData(EscfColumnKind.STRING, docCount, validity, null, null, dictionaryOffsets, dictionaryData, null, ordinals);
     }
 
-    /** Whether this column is a run-length-encoded wrapper around the column of its runs (see {@link #ofRle}). */
-    public boolean isRunLengthEncoded() {
-        return repetitions != null;
-    }
+    /** The most distinct values a dictionary-encoded column can hold: the number of values a 16-bit ordinal can address. */
+    public static final int MAX_DICTIONARY_SIZE = 1 << 16;
 
-    /** The number of runs of a run-length-encoded column. */
-    int runCount() {
-        assert isRunLengthEncoded();
-        return child.docCount();
-    }
-
-    private static long sumOfRunLengths(byte[] repetitions, int runs) {
-        long total = 0;
-        for (int i = 0; i < runs; i++) {
-            total += (repetitions[i] & 0xFF) + 1;
-        }
-        return total;
+    /** {@code true} for a dictionary-encoded STRING column (see {@link #ofDictString}). */
+    public boolean isDictionaryEncoded() {
+        return ordinals != null;
     }
 }
