@@ -66,6 +66,7 @@ import org.elasticsearch.escf.EscfColumnKind;
 import org.elasticsearch.escf.EscfColumnTransforms;
 import org.elasticsearch.escf.LuceneBinaryColumn;
 import org.elasticsearch.escf.LuceneLongColumn;
+import org.elasticsearch.escf.LuceneRleDictionaryColumn;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.IndexSortConfig;
@@ -2225,16 +2226,28 @@ public final class KeywordFieldMapper extends FieldMapper {
             // For binary doc values the terms and dv columns may share one serialization (emitSharedColumn).
             if (valuesProduced) {
                 if (emitSharedColumn) {
-                    final EscfColumnData data = values != null ? values.finish(docCount) : source.columnData();
+                    // A run-length-encoded source (and nothing dropped from it) goes to Lucene as one dictionary entry per run plus
+                    // ordinals, so it is never expanded to one value per row. Only a binary doc values column below needs the
+                    // expanded form.
+                    final boolean binaryDvs = emitDvs && columnarPayload == false && sortedSetDvs == false;
+                    final LuceneRleDictionaryColumn dictionaryTerms = values == null && (emitTerms || sortedSetDvs)
+                        ? LuceneRleDictionaryColumn.of(source, fieldType().name(), fieldType)
+                        : null;
+                    final boolean plainTerms = (emitTerms || sortedSetDvs) && dictionaryTerms == null;
+                    final EscfColumnData data = values != null
+                        ? values.finish(docCount)
+                        : (plainTerms || binaryDvs ? source.columnData() : null);
                     if (values != null) {
                         // Only the built column owns buffers; the zero-copy branch aliases the source batch,
                         // which releases them itself. Registered once because two columns share the data.
                         ctx.addResource(data);
                     }
-                    if (emitTerms || sortedSetDvs) {
+                    if (dictionaryTerms != null) {
+                        ctx.addColumn(dictionaryTerms);
+                    } else if (plainTerms) {
                         ctx.addColumn(LuceneBinaryColumn.of(data, fieldType().name(), fieldType));
                     }
-                    if (emitDvs && columnarPayload == false && sortedSetDvs == false) {
+                    if (binaryDvs) {
                         ctx.addColumn(LuceneBinaryColumn.of(data, fieldType().name(), BinaryDocValuesField.TYPE));
                     }
                 }

@@ -44,6 +44,7 @@ public final class EscfBatchBuilder implements Releasable {
 
     private final SourceSchema schema;
     private final Recycler<BytesRef> recycler;
+    private final boolean runLengthEncoding;
     private final List<EscfColumnBuilder> builders;
 
     /** Tracks which column indices have been written in the current row. Cleared by {@link #beginRow()}. */
@@ -62,7 +63,18 @@ public final class EscfBatchBuilder implements Releasable {
 
     /** Creates a builder using {@code recycler} to back column byte buffers for high-throughput paths. */
     public EscfBatchBuilder(Recycler<BytesRef> recycler) {
+        this(recycler, false);
+    }
+
+    /**
+     * Creates a builder using {@code recycler} to back column byte buffers.
+     *
+     * @param runLengthEncoding build LONG, DOUBLE, BOOL, STRING and BINARY columns run-length encoded (see {@link EscfRleColumn}),
+     *                          which pays off for data whose columns repeat across consecutive rows.
+     */
+    public EscfBatchBuilder(Recycler<BytesRef> recycler, boolean runLengthEncoding) {
         this.recycler = recycler;
+        this.runLengthEncoding = runLengthEncoding;
         this.schema = new SourceSchema();
         this.builders = new ArrayList<>(INITIAL_CAPACITY);
         this.touched = new FixedBitSet(Math.max(INITIAL_CAPACITY, 64));
@@ -185,7 +197,7 @@ public final class EscfBatchBuilder implements Releasable {
         int leafCount = schema.leafCount();
         // Ensure builders exist for every schema leaf (handles columns that only ever got absent-fills).
         while (builders.size() < leafCount) {
-            EscfColumnBuilder b = new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler);
+            EscfColumnBuilder b = new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler, runLengthEncoding);
             b.addAbsents(docCount);
             builders.add(b);
         }
@@ -220,7 +232,7 @@ public final class EscfBatchBuilder implements Releasable {
      */
     private EscfColumnBuilder ensureBuilder(int colIdx) {
         while (builders.size() <= colIdx) {
-            EscfColumnBuilder b = new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler);
+            EscfColumnBuilder b = new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler, runLengthEncoding);
             b.addAbsents(docCount);
             builders.add(b);
         }

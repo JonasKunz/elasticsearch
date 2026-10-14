@@ -65,13 +65,29 @@ public abstract class EscfColumn implements SliceableColumn {
      * storage (no per-value copy). Symmetric with {@link #from(EscfColumnData)}, this enables
      * mapper code outside this package to re-wrap a source column under a different Lucene field
      * type without going through the value-at-a-time {@link EscfColumnBuilder}.
+     *
+     * <p>The result always has one entry per document: a run-length-encoded column is expanded (once, the result is cached), so prefer
+     * working on its runs, see {@link EscfRleColumn}, when only reading.
      */
     public final EscfColumnData columnData() {
-        return toColumnData();
+        return toPlainColumnData();
+    }
+
+    /**
+     * Like {@link #from} but never returns a run-length-encoded column: those are read through their plain per-document layout. For
+     * consumers, such as the Lucene column wrappers, that cast to the concrete fixed-width or variable-width column classes.
+     */
+    static EscfColumn plainFrom(EscfColumnData col) {
+        EscfColumn column = from(col);
+        return column instanceof EscfRleColumn rle ? from(rle.toPlainColumnData()) : column;
     }
 
     /** Builds the typed column view for {@code col}, dispatching on its kind. The fields are already native. */
     public static EscfColumn from(EscfColumnData col) {
+        if (col.isRunLengthEncoded()) {
+            byte[] repetitions = col.repetitions();
+            return EscfRleColumn.of(from(col.child()), repetitions);
+        }
         int docCount = col.docCount();
         FixedBitSet validity = windowValidity(col.validity(), 0, docCount);
         return switch (col.kind()) {
@@ -259,7 +275,13 @@ public abstract class EscfColumn implements SliceableColumn {
 
     abstract EscfColumn sliceInternal(int from, int count);
 
+    /** This column in its native physical layout, which is what the wire format and batch accounting work on. */
     abstract EscfColumnData toColumnData();
+
+    /** This column in the plain per-document layout; differs from {@link #toColumnData()} only for run-length-encoded columns. */
+    EscfColumnData toPlainColumnData() {
+        return toColumnData();
+    }
 
     /**
      * Extracts a {@code count}-bit window of an validity bitset (bit set = present) starting

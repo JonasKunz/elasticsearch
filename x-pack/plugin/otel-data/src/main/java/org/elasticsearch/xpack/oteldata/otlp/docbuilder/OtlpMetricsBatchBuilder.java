@@ -27,8 +27,8 @@ import java.util.List;
  *
  * <ul>
  *   <li><b>Blocks.</b> All data points of one scope of one resource share the resource and scope fields. {@link #beginBlock} declares
- *   how many rows they span and the {@code block*Field} methods then write such a field once for all of them, as a bulk fill
- *   rather than a write per row.</li>
+ *   how many rows they span and the {@code block*Field} methods then write such a field once for all of them. The columns are
+ *   run-length encoded, so that is one entry per block.</li>
  *   <li><b>No per-row absent filling.</b> A data point holds one metric value out of potentially hundreds of metric columns, so
  *   writing an absent for every other column in every row would dominate. Columns are written positionally instead and the gaps
  *   between written rows are filled in bulk, lazily, by the column builders.</li>
@@ -195,7 +195,7 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
         writtenInRow[colIdx] = docCount + 1;
         // Rows before the first one a column is written in are absent: the builder fills them in lazily.
         while (builders.size() <= colIdx) {
-            builders.add(new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler));
+            builders.add(new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler, true));
         }
         return builders.get(colIdx);
     }

@@ -14,10 +14,13 @@ import org.apache.lucene.document.column.BinaryColumn;
 import org.apache.lucene.document.column.BytesRefValuesCursor;
 import org.apache.lucene.document.column.Column;
 import org.apache.lucene.document.column.ColumnBatch;
+import org.apache.lucene.document.column.DictionaryColumn;
 import org.apache.lucene.document.column.LongColumn;
 import org.apache.lucene.document.column.LongTupleCursor;
 import org.apache.lucene.document.column.LongValuesCursor;
 import org.apache.lucene.document.column.ObjectTupleCursor;
+import org.apache.lucene.document.column.OrdinalsCursor;
+import org.apache.lucene.document.column.OrdinalsTupleCursor;
 import org.apache.lucene.document.column.TokenStreamColumn;
 import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.search.DocIdSetIterator;
@@ -415,8 +418,16 @@ public abstract class AbstractColumnarMapperCompatibilityTestCase extends Mapper
         }
     }
 
-    private static EscfBatch encode(List<BytesReference> sources, SourceEncoder encoder) throws IOException {
-        try (EscfEncoder escfEncoder = new EscfEncoder(BytesRefRecycler.NON_RECYCLING_INSTANCE, encoder.allowSimd)) {
+    /**
+     * Whether the source columns are run-length encoded, as the OTLP metrics path produces them. A subclass returns {@code true} to run
+     * all of its scenarios against that column layout instead of the plain one.
+     */
+    protected boolean runLengthEncoded() {
+        return false;
+    }
+
+    private EscfBatch encode(List<BytesReference> sources, SourceEncoder encoder) throws IOException {
+        try (EscfEncoder escfEncoder = new EscfEncoder(BytesRefRecycler.NON_RECYCLING_INSTANCE, encoder.allowSimd, runLengthEncoded())) {
             for (BytesReference source : sources) {
                 escfEncoder.addDocument(source, XContentType.JSON);
             }
@@ -519,6 +530,22 @@ public abstract class AbstractColumnarMapperCompatibilityTestCase extends Mapper
                     final BytesRefValuesCursor cursor = binaryColumn.values();
                     for (int doc = 0; doc < cursor.size(); doc++) {
                         perDoc.get(doc).add(new FieldDescriptor(name, typeFor(column, doc), null, BytesRef.deepCopyOf(cursor.nextValue())));
+                    }
+                }
+            } else if (column instanceof DictionaryColumn dictionaryColumn) {
+                // A dictionary column resolves to the same values a binary column would: look each ordinal up in the dictionary.
+                final List<BytesRef> dictionary = dictionaryColumn.dictionary();
+                if (isSparse || randomBoolean()) {
+                    final OrdinalsTupleCursor cursor = dictionaryColumn.tuples();
+                    for (int doc = cursor.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = cursor.nextDoc()) {
+                        final BytesRef value = BytesRef.deepCopyOf(dictionary.get(cursor.ordValue()));
+                        perDoc.get(doc).add(new FieldDescriptor(name, typeFor(column, doc), null, value));
+                    }
+                } else {
+                    final OrdinalsCursor cursor = dictionaryColumn.values();
+                    for (int doc = 0; doc < cursor.size(); doc++) {
+                        final BytesRef value = BytesRef.deepCopyOf(dictionary.get(cursor.nextOrd()));
+                        perDoc.get(doc).add(new FieldDescriptor(name, typeFor(column, doc), null, value));
                     }
                 }
             } else if (column instanceof TokenStreamColumn) {

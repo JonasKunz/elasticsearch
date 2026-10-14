@@ -179,6 +179,10 @@ public final class EscfBatch implements SourceBatch {
 
     /** Raw value bytes of one column: the payload ref length, or the kind-specific equivalent when there is no payload. */
     private static int valueBytes(EscfColumnData col) {
+        if (col.isRunLengthEncoded()) {
+            // the values of the runs plus one repetition byte per run
+            return valueBytes(col.child()) + col.runCount();
+        }
         return switch (col.kind()) {
             case EscfColumnKind.LONG, EscfColumnKind.DOUBLE, EscfColumnKind.STRING, EscfColumnKind.BINARY, EscfColumnKind.UNION ->
                 (int) refLen(col.data());
@@ -222,6 +226,9 @@ public final class EscfBatch implements SourceBatch {
             .offsets() != null ? col.offsets().length * 4L : 0L) + refLen(col.data());
         if (col.child() != null) {
             total += columnRamBytes(col.child());
+        }
+        if (col.repetitions() != null) {
+            total += col.repetitions().length;
         }
         return total;
     }

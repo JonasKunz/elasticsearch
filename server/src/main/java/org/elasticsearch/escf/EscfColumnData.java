@@ -34,6 +34,9 @@ import org.elasticsearch.sourcebatch.SourceValueType;
  *       Kept native rather than pre-serialized so the "native in-memory" invariant above also holds for
  *       ARRAY; it is only flattened to {@code child_kind(1) | child_values} bytes at the wire boundary in
  *       {@link EscfBatch}.</li>
+ *   <li>{@code repetitions} — for a run-length-encoded column only (see {@link #ofRle}): one unsigned byte per run holding
+ *       {@code runLength - 1}. Such a column's {@code docCount} is the number of logical documents, its {@code kind} is the kind of
+ *       the values, and every other factor is {@code null} except {@code child}, which holds the column of the runs.</li>
  * </ul>
  */
 public record EscfColumnData(
@@ -44,8 +47,12 @@ public record EscfColumnData(
     BytesRef typeVector,
     int[] offsets,
     BytesReference data,
-    EscfColumnData child
+    EscfColumnData child,
+    byte[] repetitions
 ) implements Releasable {
+
+    /** The most documents a single run of a run-length-encoded column can cover: its repetitions are stored in one unsigned byte. */
+    public static final int MAX_RUN_LENGTH = 256;
 
     /**
      * Releases the recycler-backed buffers this column owns: its own {@code data} payload (when it is
@@ -60,26 +67,62 @@ public record EscfColumnData(
 
     /** LONG or DOUBLE: a dense 8-byte-per-document value payload; no offsets or type vector. */
     static EscfColumnData ofFixed64(byte kind, int docCount, FixedBitSet validity, BytesReference data) {
-        return new EscfColumnData(kind, docCount, validity, null, null, null, data, null);
+        return new EscfColumnData(kind, docCount, validity, null, null, null, data, null, null);
     }
 
     /** BOOL: the value bitset directly; no byte payload. */
     static EscfColumnData ofBool(int docCount, FixedBitSet validity, FixedBitSet values) {
-        return new EscfColumnData(EscfColumnKind.BOOL, docCount, validity, values, null, null, null, null);
+        return new EscfColumnData(EscfColumnKind.BOOL, docCount, validity, values, null, null, null, null, null);
     }
 
     /** STRING or BINARY: an offset vector plus a dense byte payload. */
     static EscfColumnData ofVarWidth(byte kind, int docCount, FixedBitSet validity, int[] offsets, BytesReference data) {
-        return new EscfColumnData(kind, docCount, validity, null, null, offsets, data, null);
+        return new EscfColumnData(kind, docCount, validity, null, null, offsets, data, null, null);
     }
 
     /** ARRAY: per-row element-range offsets over a native primitive {@code child} sub-column. */
     static EscfColumnData ofArray(int docCount, FixedBitSet validity, int[] offsets, EscfColumnData child) {
-        return new EscfColumnData(EscfColumnKind.ARRAY, docCount, validity, null, null, offsets, null, child);
+        return new EscfColumnData(EscfColumnKind.ARRAY, docCount, validity, null, null, offsets, null, child, null);
     }
 
     /** UNION: a per-document type vector, an offset vector, and a dense value payload. */
     static EscfColumnData ofUnion(int docCount, FixedBitSet validity, BytesRef typeVector, int[] offsets, BytesReference data) {
-        return new EscfColumnData(EscfColumnKind.UNION, docCount, validity, null, typeVector, offsets, data, null);
+        return new EscfColumnData(EscfColumnKind.UNION, docCount, validity, null, typeVector, offsets, data, null, null);
+    }
+
+    /**
+     * A run-length-encoded column: {@code runs} holds one value (or absence) per run of consecutive equal documents, and
+     * {@code repetitions[i] + 1} is the length of run {@code i}, so a run covers between 1 and {@link #MAX_RUN_LENGTH} documents.
+     * A longer stretch of equal documents is stored as several consecutive runs with the same value. {@code runs} must be a LONG,
+     * DOUBLE, BOOL, STRING or BINARY column.
+     *
+     * @param docCount    the number of logical documents, the sum of the run lengths
+     * @param repetitions at least {@code runs.docCount()} entries; the first {@code runs.docCount()} are used
+     */
+    static EscfColumnData ofRle(int docCount, EscfColumnData runs, byte[] repetitions) {
+        assert runs.isRunLengthEncoded() == false && runs.kind() != EscfColumnKind.ARRAY && runs.kind() != EscfColumnKind.UNION
+            : "cannot run-length-encode a " + EscfColumnKind.name(runs.kind()) + " column";
+        assert repetitions.length >= runs.docCount();
+        assert sumOfRunLengths(repetitions, runs.docCount()) == docCount : "run lengths do not add up to " + docCount;
+        return new EscfColumnData(runs.kind(), docCount, null, null, null, null, null, runs, repetitions);
+    }
+
+    /** Whether this column is a run-length-encoded wrapper around the column of its runs (see {@link #ofRle}). */
+    public boolean isRunLengthEncoded() {
+        return repetitions != null;
+    }
+
+    /** The number of runs of a run-length-encoded column. */
+    int runCount() {
+        assert isRunLengthEncoded();
+        return child.docCount();
+    }
+
+    private static long sumOfRunLengths(byte[] repetitions, int runs) {
+        long total = 0;
+        for (int i = 0; i < runs; i++) {
+            total += (repetitions[i] & 0xFF) + 1;
+        }
+        return total;
     }
 }

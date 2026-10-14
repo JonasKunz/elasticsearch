@@ -54,13 +54,13 @@ public class LuceneBinaryColumn extends BinaryColumn implements LuceneColumn {
 
     /** Creates a dense ({@link Density#DENSE}) column from a STRING or BINARY {@link EscfColumnData}. */
     public static LuceneBinaryColumn stringColumn(EscfColumnData data, String name, IndexableFieldType fieldType) {
-        return new LuceneBinaryColumn(EscfColumn.from(data), name, fieldType, Density.DENSE, null);
+        return new LuceneBinaryColumn(EscfColumn.plainFrom(data), name, fieldType, Density.DENSE, null);
     }
 
     /** Creates a sparse ({@link Density#SPARSE}) column from an ARRAY {@link EscfColumnData}. */
     public static LuceneBinaryColumn arrayColumn(EscfColumnData data, String name, IndexableFieldType fieldType) {
         assert data.kind() == EscfColumnKind.ARRAY : "expected ARRAY, got " + EscfColumnKind.name(data.kind());
-        return new LuceneBinaryColumn(EscfColumn.from(data), name, fieldType, Density.SPARSE, null);
+        return new LuceneBinaryColumn(EscfColumn.plainFrom(data), name, fieldType, Density.SPARSE, null);
     }
 
     /**
@@ -72,7 +72,7 @@ public class LuceneBinaryColumn extends BinaryColumn implements LuceneColumn {
             case EscfColumnKind.STRING, EscfColumnKind.BINARY -> {
                 // Use SPARSE when validity is non-null so absent docs are skipped by tuples().
                 Density density = data.validity() == null ? Density.DENSE : Density.SPARSE;
-                yield new LuceneBinaryColumn(EscfColumn.from(data), name, fieldType, density, null);
+                yield new LuceneBinaryColumn(EscfColumn.plainFrom(data), name, fieldType, density, null);
             }
             case EscfColumnKind.ARRAY -> arrayColumn(data, name, fieldType);
             default -> throw new AssertionError("unexpected column kind: " + EscfColumnKind.name(data.kind()));
