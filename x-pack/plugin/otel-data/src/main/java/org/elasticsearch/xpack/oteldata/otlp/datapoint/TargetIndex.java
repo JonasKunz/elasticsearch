@@ -80,6 +80,20 @@ public final class TargetIndex {
     }
 
     /**
+     * Whether any of {@code attributes} can influence the target index. When a data point's attributes cannot, its target is the
+     * one {@link #evaluate} computes from the scope and resource alone, so callers evaluate that once per scope instead of once
+     * per data point.
+     */
+    public static boolean hasTargetIndexAttribute(List<KeyValue> attributes) {
+        for (int i = 0, size = attributes.size(); i < size; i++) {
+            if (isTargetIndexAttribute(attributes.get(i).getKey())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Determines the target index for a data point.
      *
      * @param type The data stream type (e.g., "metrics", "logs").

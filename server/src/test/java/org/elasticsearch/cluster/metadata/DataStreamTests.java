@@ -3331,4 +3331,43 @@ public class DataStreamTests extends AbstractXContentSerializingTestCase<DataStr
             )
         );
     }
+
+    /**
+     * The sanitizers have a no-copy fast path for input that is already canonical; it must agree with the general (regex) path on
+     * any input and return the input itself when nothing changes.
+     */
+    public void testSanitizeDataStreamFields() {
+        String[] disallowed = { "\\", "/", "*", "?", "\"", "<", ">", "|", " ", ",", "#", ":" };
+        for (int i = 0; i < 200; i++) {
+            StringBuilder sb = new StringBuilder();
+            int length = randomIntBetween(0, 120);
+            for (int j = 0; j < length; j++) {
+                switch (randomInt(6)) {
+                    case 0 -> sb.append(randomFrom(disallowed));
+                    case 1 -> sb.append('-');
+                    case 2 -> sb.append(randomFrom('A', 'Z', 'É', 'ß'));
+                    case 3 -> sb.append(randomFrom('.', '_', '1', '9'));
+                    default -> sb.append(randomAlphaOfLength(1).toLowerCase(Locale.ROOT));
+                }
+            }
+            String input = sb.toString();
+            String lowered = input.toLowerCase(Locale.ROOT);
+            String truncated = lowered.substring(0, Math.min(lowered.length(), 100));
+            String expectedDataset = truncated.replaceAll("[\\\\/*?\"<>| ,#:-]", "_");
+            String expectedNamespace = truncated.replaceAll("[\\\\/*?\"<>| ,#:]", "_");
+
+            assertEquals(input, expectedDataset, DataStream.sanitizeDataset(input));
+            assertEquals(input, expectedDataset, DataStream.sanitizeType(input));
+            assertEquals(input, expectedNamespace, DataStream.sanitizeNamespace(input));
+            if (expectedDataset.equals(input)) {
+                assertSame("canonical input is returned as is", input, DataStream.sanitizeDataset(input));
+            }
+            if (expectedNamespace.equals(input)) {
+                assertSame("canonical input is returned as is", input, DataStream.sanitizeNamespace(input));
+            }
+        }
+        assertSame("my-namespace", DataStream.sanitizeNamespace("my-namespace"));
+        assertEquals("my_dataset", DataStream.sanitizeDataset("my-dataset"));
+        assertNull(DataStream.sanitizeDataset(null));
+    }
 }

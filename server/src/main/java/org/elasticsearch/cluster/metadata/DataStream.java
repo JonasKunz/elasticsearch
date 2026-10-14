@@ -172,9 +172,44 @@ public final class DataStream implements SimpleDiffable<DataStream>, ToXContentO
         if (s == null) {
             return null;
         }
+        if (isSanitized(s, disallowedInDataset == DISALLOWED_IN_NAMESPACE)) {
+            // The common case, on hot paths such as OTLP ingest where this runs per data point: nothing to change, so no regex
+            // matcher and no copies.
+            return s;
+        }
         s = s.toLowerCase(Locale.ROOT);
         s = s.substring(0, Math.min(s.length(), MAX_LENGTH));
         return disallowedInDataset.matcher(s).replaceAll(REPLACEMENT);
+    }
+
+    /**
+     * Whether {@link #sanitizeDataStreamField} would return {@code s} unchanged: ASCII, no upper case letter, not too long and
+     * none of the disallowed characters. Non-ASCII input is left to the slow path, which knows how to lower-case it.
+     */
+    private static boolean isSanitized(String s, boolean dashAllowed) {
+        if (s.length() > MAX_LENGTH) {
+            return false;
+        }
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= 0x80 || (c >= 'A' && c <= 'Z')) {
+                return false;
+            }
+            switch (c) {
+                case '\\', '/', '*', '?', '"', '<', '>', '|', ' ', ',', '#', ':' -> {
+                    return false;
+                }
+                case '-' -> {
+                    if (dashAllowed == false) {
+                        return false;
+                    }
+                }
+                default -> {
+                    // allowed
+                }
+            }
+        }
+        return true;
     }
 
     // Timeseries indices' leaf readers should be sorted by desc order of their timestamp field, as it allows search time optimizations

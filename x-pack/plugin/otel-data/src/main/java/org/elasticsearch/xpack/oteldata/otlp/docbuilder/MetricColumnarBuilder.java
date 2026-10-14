@@ -142,18 +142,28 @@ public final class MetricColumnarBuilder {
                 }
                 batchBuilder.beginBlock(scopeDataPoints);
                 boolean blockLeader = true;
+                // The target of every data point that does not route itself; computed once per scope rather than per data point.
+                TargetIndex scopeTarget = TargetIndex.evaluate(
+                    TargetIndex.TYPE_METRICS,
+                    List.of(),
+                    scopeRoutingDataset,
+                    scope.getAttributesList(),
+                    resource.getAttributesList()
+                );
                 for (int k = 0; k < metrics.size(); k++) {
                     Metric metric = metrics.get(k);
                     List<NumberDataPoint> dataPoints = numberDataPoints(metric);
                     for (int l = 0; l < dataPoints.size(); l++) {
                         DataPoint dataPoint = new DataPoint.Number(dataPoints.get(l), metric);
-                        TargetIndex targetIndex = TargetIndex.evaluate(
-                            TargetIndex.TYPE_METRICS,
-                            dataPoint.getAttributes(),
-                            scopeRoutingDataset,
-                            scope.getAttributesList(),
-                            resource.getAttributesList()
-                        );
+                        TargetIndex targetIndex = TargetIndex.hasTargetIndexAttribute(dataPoint.getAttributes())
+                            ? TargetIndex.evaluate(
+                                TargetIndex.TYPE_METRICS,
+                                dataPoint.getAttributes(),
+                                scopeRoutingDataset,
+                                scope.getAttributesList(),
+                                resource.getAttributesList()
+                            )
+                            : scopeTarget;
                         if (target == null) {
                             target = targetIndex.index();
                             if (targetSupported.test(target) == false) {

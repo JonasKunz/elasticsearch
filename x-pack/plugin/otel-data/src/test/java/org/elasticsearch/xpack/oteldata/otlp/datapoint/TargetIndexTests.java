@@ -373,4 +373,13 @@ public class TargetIndexTests extends ESTestCase {
     private KeyValue createStringAttribute(String key, String value) {
         return KeyValue.newBuilder().setKey(key).setValue(AnyValue.newBuilder().setStringValue(value).build()).build();
     }
+
+    public void testHasTargetIndexAttribute() {
+        assertThat(TargetIndex.hasTargetIndexAttribute(List.of()), is(false));
+        assertThat(TargetIndex.hasTargetIndexAttribute(List.of(createStringAttribute("host.name", "h"))), is(false));
+        for (String key : List.of("elasticsearch.index", "data_stream.dataset", "data_stream.namespace")) {
+            List<KeyValue> attributes = List.of(createStringAttribute("host.name", "h"), createStringAttribute(key, "v"));
+            assertThat(key, TargetIndex.hasTargetIndexAttribute(attributes), is(true));
+        }
+    }
 }
