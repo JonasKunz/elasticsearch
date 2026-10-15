@@ -16,6 +16,7 @@ import org.apache.lucene.document.column.LongTupleCursor;
 import org.apache.lucene.document.column.ObjectTupleCursor;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.hash.BufferedMurmur3Hasher;
 import org.elasticsearch.escf.EscfBatch;
 import org.elasticsearch.escf.EscfColumnKind;
@@ -58,7 +59,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         OtlpMetricsBatchBuilder batchBuilder,
         ExportMetricsServiceRequest request
     ) {
-        MetricColumnarBuilder.Rows rows = columnarBuilder.buildRows(batchBuilder, request, target -> true);
+        MetricColumnarBuilder.Rows rows = columnarBuilder.buildRows(batchBuilder, new BytesArray(request.toByteArray()), target -> true);
         return rows == null ? List.of(false) : Collections.nCopies(rows.rowRequests().size(), true);
     }
 
@@ -316,13 +317,13 @@ public class MetricColumnarBuilderTests extends ESTestCase {
 
         OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(false), writeRows(batchBuilder, request));
-        // The failed row is aborted, not rolled back: it still occupies a row in the (to be discarded) batch.
-        assertEquals(1, batchBuilder.docCount());
+        // The attributes of a data point are read before its row is started, so nothing was written to the (to be discarded) batch.
+        assertEquals(0, batchBuilder.docCount());
     }
 
     /**
-     * OTel attribute lists may contain duplicate keys, which {@code OtlpMetricsBatchBuilder} rejects. There is no up-front
-     * scan for this; the resulting exception must be turned into a {@code false} return while writing.
+     * OTel attribute lists may contain duplicate keys, which {@code OtlpMetricsBatchBuilder} rejects. Resource attributes are
+     * only written once their rows are known, so the duplicate must be detected when their fields are declared.
      */
     public void testBuildMetricRowReturnsFalseForDuplicateAttributeKey() throws Exception {
         ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
@@ -336,7 +337,7 @@ public class MetricColumnarBuilderTests extends ESTestCase {
 
         OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(false), writeRows(batchBuilder, request));
-        assertEquals(1, batchBuilder.docCount());
+        assertEquals(0, batchBuilder.docCount());
     }
 
     /**
@@ -415,12 +416,12 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(false), writeRows(batchBuilder, bad));
         assertEquals(List.of(true), writeRows(batchBuilder, good));
-        assertEquals("the aborted row keeps its row index", 2, batchBuilder.docCount());
+        assertEquals("the rejected resource wrote no row", 1, batchBuilder.docCount());
 
         EscfBatch batch = batchBuilder.build();
-        assertEquals(2, batch.docCount());
-        assertEquals(List.of("bad", "good"), readStringColumn(batch, "resource.attributes.service.name"));
-        assertTrue("column from the failed row must have no values", readStringColumn(batch, "resource.attributes.tags").isEmpty());
+        assertEquals(1, batch.docCount());
+        assertEquals(List.of("good"), readStringColumn(batch, "resource.attributes.service.name"));
+        assertTrue("column from the failed resource must have no values", readStringColumn(batch, "resource.attributes.tags").isEmpty());
     }
 
     /**
@@ -501,5 +502,140 @@ public class MetricColumnarBuilderTests extends ESTestCase {
         OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
         assertEquals(List.of(true), writeRows(batchBuilder, request));
         assertEquals(expected, readStringColumn(batchBuilder.build(), "_metric_names_hash"));
+    }
+
+    /**
+     * Protobuf does not prescribe the order of fields on the wire. The Java runtime writes them in ascending field number order,
+     * but the Go runtime used by the OpenTelemetry Collector writes them in descending order: a metric's data points precede its
+     * temporality, unit and name, a scope's metrics precede the scope itself. The streaming parser must produce the same batch
+     * for both encodings.
+     */
+    public void testFieldOrderOnTheWireDoesNotMatter() throws Exception {
+        // both scopes route to the hostmetricsreceiver data stream; a single request may only target one data stream
+        String cpuScraper =
+            "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/cpuscraper";
+        String memoryScraper =
+            "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/memoryscraper";
+        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
+            .addResourceMetrics(
+                createResourceMetrics(
+                    List.of(keyValue("service.name", "svc"), keyValue("host.name", "h1"), keyValue("port", 42)),
+                    List.of(
+                        createScopeMetrics(
+                            cpuScraper,
+                            "1.2.3",
+                            List.of(
+                                createSumMetric(
+                                    "system.cpu.time",
+                                    "s",
+                                    List.of(
+                                        createDoubleDataPoint(nowNanos, nowNanos - 1000, List.of(keyValue("state", "user"))),
+                                        createDoubleDataPoint(nowNanos, nowNanos - 1000, List.of(keyValue("state", "system")))
+                                    ),
+                                    true,
+                                    AGGREGATION_TEMPORALITY_CUMULATIVE
+                                    // a description (field 2) between data points and name, like the collector emits it
+                                ).toBuilder().setDescription("Total seconds each logical CPU spent on each mode").build(),
+                                createGaugeMetric("system.cpu.utilization", "1", List.of(createDoubleDataPoint(nowNanos + 1))).toBuilder()
+                                    .setDescription("Difference in system.cpu.time since the last measurement per logical CPU")
+                                    .build()
+                            )
+                        ),
+                        createScopeMetrics(
+                            memoryScraper,
+                            "2",
+                            List.of(createGaugeMetric("mem", "By", List.of(createLongDataPoint(nowNanos))))
+                        )
+                    )
+                )
+            )
+            .addResourceMetrics(
+                createResourceMetrics(
+                    List.of(keyValue("service.name", "svc2")),
+                    List.of(
+                        createScopeMetrics(
+                            memoryScraper,
+                            "2",
+                            List.of(createGaugeMetric("mem", "By", List.of(createLongDataPoint(nowNanos))))
+                        )
+                    )
+                )
+            )
+            .build();
+
+        byte[] ascending = request.toByteArray();
+        byte[] descending = serializeFieldsDescending(request);
+        assertFalse("the two encodings must really differ", java.util.Arrays.equals(ascending, descending));
+        assertEquals(request, ExportMetricsServiceRequest.parseFrom(descending));
+
+        OtlpMetricsBatchBuilder ascendingBuilder = new OtlpMetricsBatchBuilder();
+        MetricColumnarBuilder.Rows ascendingRows = builder.buildRows(ascendingBuilder, new BytesArray(ascending), target -> true);
+        OtlpMetricsBatchBuilder descendingBuilder = new OtlpMetricsBatchBuilder();
+        MetricColumnarBuilder.Rows descendingRows = builder.buildRows(descendingBuilder, new BytesArray(descending), target -> true);
+        assertNotNull(ascendingRows);
+        assertNotNull(descendingRows);
+        assertEquals(5, descendingRows.rowRequests().size());
+        assertEquals(ascendingRows.target(), descendingRows.target());
+        assertArrayEquals(ascendingRows.timestampsNanos(), descendingRows.timestampsNanos());
+        for (int i = 0; i < ascendingRows.rowRequests().size(); i++) {
+            assertEquals(
+                ascendingRows.rowRequests().get(i).getDynamicTemplates(),
+                descendingRows.rowRequests().get(i).getDynamicTemplates()
+            );
+        }
+        try (EscfBatch ascendingBatch = ascendingBuilder.build(); EscfBatch descendingBatch = descendingBuilder.build()) {
+            assertEquals(ascendingBatch.data(), descendingBatch.data());
+        }
+    }
+
+    /** Serializes {@code message} with the fields of every (nested) message in descending field number order. */
+    private static byte[] serializeFieldsDescending(com.google.protobuf.Message message) throws java.io.IOException {
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        com.google.protobuf.CodedOutputStream out = com.google.protobuf.CodedOutputStream.newInstance(bytes);
+        List<java.util.Map.Entry<com.google.protobuf.Descriptors.FieldDescriptor, Object>> fields = new ArrayList<>(
+            message.getAllFields().entrySet()
+        );
+        Collections.reverse(fields);
+        for (var entry : fields) {
+            com.google.protobuf.Descriptors.FieldDescriptor field = entry.getKey();
+            if (field.isRepeated()) {
+                for (Object element : (List<?>) entry.getValue()) {
+                    writeFieldDescending(out, field, element);
+                }
+            } else {
+                writeFieldDescending(out, field, entry.getValue());
+            }
+        }
+        out.flush();
+        return bytes.toByteArray();
+    }
+
+    private static void writeFieldDescending(
+        com.google.protobuf.CodedOutputStream out,
+        com.google.protobuf.Descriptors.FieldDescriptor field,
+        Object value
+    ) throws java.io.IOException {
+        int number = field.getNumber();
+        switch (field.getType()) {
+            case MESSAGE -> {
+                byte[] nested = serializeFieldsDescending((com.google.protobuf.Message) value);
+                out.writeTag(number, com.google.protobuf.WireFormat.WIRETYPE_LENGTH_DELIMITED);
+                out.writeUInt32NoTag(nested.length);
+                out.writeRawBytes(nested);
+            }
+            case STRING -> out.writeString(number, (String) value);
+            case BYTES -> out.writeBytes(number, (com.google.protobuf.ByteString) value);
+            case BOOL -> out.writeBool(number, (Boolean) value);
+            case ENUM -> out.writeEnum(number, ((com.google.protobuf.Descriptors.EnumValueDescriptor) value).getNumber());
+            case INT32 -> out.writeInt32(number, (Integer) value);
+            case UINT32 -> out.writeUInt32(number, (Integer) value);
+            case INT64 -> out.writeInt64(number, (Long) value);
+            case UINT64 -> out.writeUInt64(number, (Long) value);
+            case FIXED64 -> out.writeFixed64(number, (Long) value);
+            case SFIXED64 -> out.writeSFixed64(number, (Long) value);
+            case FIXED32 -> out.writeFixed32(number, (Integer) value);
+            case DOUBLE -> out.writeDouble(number, (Double) value);
+            default -> throw new AssertionError("not used by OTLP metrics: " + field.getType());
+        }
     }
 }

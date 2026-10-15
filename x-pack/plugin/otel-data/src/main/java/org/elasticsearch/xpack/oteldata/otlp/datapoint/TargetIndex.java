@@ -110,13 +110,35 @@ public final class TargetIndex {
         List<KeyValue> scopeAttributes,
         List<KeyValue> resourceAttributes
     ) {
+        return evaluate(
+            type,
+            firstAttributeValue(ELASTICSEARCH_INDEX, attributes, scopeAttributes, resourceAttributes),
+            firstAttributeValue(DATA_STREAM_DATASET, attributes, scopeAttributes, resourceAttributes),
+            firstAttributeValue(DATA_STREAM_NAMESPACE, attributes, scopeAttributes, resourceAttributes),
+            scopeRoutingDataset
+        );
+    }
+
+    /**
+     * Evaluates the target from already resolved attribute values, for callers that read the attributes without materializing
+     * {@link KeyValue} objects. Each value is the first {@code elasticsearch.index}, {@code data_stream.dataset} and
+     * {@code data_stream.namespace} attribute found in data point, scope and resource attributes, in that order of precedence,
+     * or {@code null} if none of them carries it.
+     */
+    public static TargetIndex evaluate(
+        String type,
+        @Nullable String elasticsearchIndex,
+        @Nullable String dataset,
+        @Nullable String namespace,
+        @Nullable String scopeRoutingDataset
+    ) {
         // Order:
         // 1. elasticsearch.index from attributes, scope.attributes, resource.attributes
         // 2. read data_stream.* from attributes, scope.attributes, resource.attributes
         // 3. scope-based routing
         // 4. use default hardcoded data_stream.* (<type>-generic-default)
         TargetIndex target = new TargetIndex();
-        target.index = firstAttributeValue(ELASTICSEARCH_INDEX, attributes, scopeAttributes, resourceAttributes);
+        target.index = elasticsearchIndex;
         if (target.index != null) {
             target.type = null;
             target.dataset = null;
@@ -124,7 +146,7 @@ public final class TargetIndex {
             return target;
         }
         target.type = type;
-        target.dataset = firstAttributeValue(DATA_STREAM_DATASET, attributes, scopeAttributes, resourceAttributes);
+        target.dataset = dataset;
         if (target.dataset == null && scopeRoutingDataset != null) {
             target.dataset = scopeRoutingDataset;
         }
@@ -132,7 +154,7 @@ public final class TargetIndex {
             target.dataset = DEFAULT_DATASET;
         }
         target.dataset = sanitizeDataset(target.dataset);
-        target.namespace = firstAttributeValue(DATA_STREAM_NAMESPACE, attributes, scopeAttributes, resourceAttributes);
+        target.namespace = namespace;
         if (target.namespace == null) {
             target.namespace = DEFAULT_NAMESPACE;
         }
@@ -142,19 +164,27 @@ public final class TargetIndex {
     }
 
     public static @Nullable String extractScopeRoutingDataset(InstrumentationScope scope) {
-        String scopeName = scope.getName();
-        if (SELF_TELEMETRY_SCOPES.contains(scopeName)) {
-            return SELF_TELEMETRY_DATASET;
-        }
+        String encodingFormat = null;
         for (int i = 0, size = scope.getAttributesCount(); i < size; i++) {
             KeyValue attribute = scope.getAttributes(i);
             if (ENCODING_FORMAT.equals(attribute.getKey()) && attribute.getValue().hasStringValue()) {
-                String format = attribute.getValue().getStringValue();
-                if (format.isEmpty() == false) {
-                    return format;
-                }
+                encodingFormat = attribute.getValue().getStringValue();
                 break;
             }
+        }
+        return extractScopeRoutingDataset(scope.getName(), encodingFormat);
+    }
+
+    /**
+     * Variant of {@link #extractScopeRoutingDataset(InstrumentationScope)} for callers that have already read the scope name and
+     * the value of its first string-valued {@code encoding.format} attribute ({@code null} if there is none).
+     */
+    public static @Nullable String extractScopeRoutingDataset(String scopeName, @Nullable String encodingFormat) {
+        if (SELF_TELEMETRY_SCOPES.contains(scopeName)) {
+            return SELF_TELEMETRY_DATASET;
+        }
+        if (encodingFormat != null && encodingFormat.isEmpty() == false) {
+            return encodingFormat;
         }
         return extractComponentName(scopeName);
     }

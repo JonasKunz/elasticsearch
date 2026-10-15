@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.oteldata.otlp.docbuilder;
 
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.StringHelper;
 import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
@@ -17,6 +18,7 @@ import org.elasticsearch.escf.EscfColumnData;
 import org.elasticsearch.sourcebatch.SourceSchema;
 import org.elasticsearch.transport.BytesRefRecycler;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -26,17 +28,23 @@ import java.util.List;
  * {@link org.elasticsearch.escf.EscfBatchBuilder} that exploits the shape of OTLP metrics data:
  *
  * <ul>
- *   <li><b>Blocks.</b> All data points of one scope of one resource share the resource and scope fields. {@link #beginBlock} declares
- *   how many rows they span and the {@code block*Field} methods then write such a field once for all of them. On a dictionary-encoded
- *   string column that costs a fill of the ordinal array rather than a dictionary lookup per row.</li>
+ *   <li><b>Fields written for a range of rows at once.</b> All data points of one scope of one resource share the resource and scope
+ *   fields. Such a field is {@link #declareField declared} when its value is first seen, so that it takes its place in the schema,
+ *   and written once for all of its rows by a {@code repeated*Field} call once the rows are known. When the data points are
+ *   streamed from the wire their number is not known in advance, so the write happens after the last of them; on a
+ *   dictionary-encoded string column it costs a fill of the ordinal array rather than a dictionary lookup per row.</li>
+ *   <li><b>Fields addressed by handle.</b> {@link #declareField} returns a handle for a leaf of the current object, and the
+ *   handle-based setters write to it without looking the name up again. Names can be given as UTF-8 bytes pointing into the
+ *   request payload: a handle lookup by bytes does not allocate once the leaf exists, which keeps attribute keys from being
+ *   materialized as strings for every data point.</li>
  *   <li><b>No per-row absent filling.</b> A data point holds one metric value out of potentially hundreds of metric columns, so
  *   writing an absent for every other column in every row would dominate. Columns are written positionally instead and the gaps
  *   between written rows are filled in bulk, lazily, by the column builders.</li>
  * </ul>
  *
- * <p>Usage per row: {@link #beginRow()}, field writes, {@link #finishRow()}. Block fields are only written in the first row of a
- * block, and must not be written again in the remaining rows of it. Leaf order in the schema is first-appearance order, as in the
- * generic builder, which determines the field order of the reconstructed {@code _source}.
+ * <p>Usage per row: {@link #beginRow()}, field writes, {@link #finishRow()}. Leaf order in the schema is first-appearance order (a
+ * declaration counts as an appearance), as in the generic builder, which determines the field order of the reconstructed
+ * {@code _source}.
  */
 public final class OtlpMetricsBatchBuilder implements Releasable {
 
@@ -48,15 +56,16 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
     private final List<EscfColumnBuilder> builders = new ArrayList<>(INITIAL_CAPACITY);
     /** Per leaf: {@code 1 + the row it was last written in}, to reject duplicate fields within a row. */
     private int[] writtenInRow = new int[INITIAL_CAPACITY];
+    /** Per leaf: its name as UTF-8, for the lookup by bytes. */
+    private byte[][] leafNames = new byte[INITIAL_CAPACITY][];
+    /** Open-addressing table from (parent, UTF-8 name) to {@code 1 + leaf index}; {@code 0} marks an empty slot. */
+    private int[] leafLookup = new int[INITIAL_CAPACITY * 2];
+    private int leafLookupSize;
 
     private int[] parentStack = new int[8];
     private int parentDepth;
 
     private int docCount;
-    /** The number of rows in the open block, or {@code 0}. */
-    private int blockRows;
-    /** The first row of the open block. */
-    private int blockStart;
 
     /** Creates a builder with dictionary-encoded string columns and no buffer recycling, for tests. */
     public OtlpMetricsBatchBuilder() {
@@ -75,11 +84,7 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
 
     /** Completes the current row and returns its zero-based index. */
     public int finishRow() {
-        int row = docCount++;
-        if (blockRows > 0 && docCount == blockStart + blockRows) {
-            blockRows = 0;
-        }
-        return row;
+        return docCount++;
     }
 
     /**
@@ -88,21 +93,6 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
      */
     public void abortRow() {
         finishRow();
-    }
-
-    /**
-     * Declares that the next {@code rows} rows share the values of the block fields that the first of them writes.
-     * A block must be complete before the next one starts.
-     */
-    public void beginBlock(int rows) {
-        if (blockRows > 0) {
-            throw new IllegalStateException("a block of [" + blockRows + "] rows is still open");
-        }
-        if (rows <= 0) {
-            throw new IllegalArgumentException("a block needs at least one row, got [" + rows + "]");
-        }
-        blockRows = rows;
-        blockStart = docCount;
     }
 
     public void startObject(String name) {
@@ -119,44 +109,99 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
         parentDepth--;
     }
 
+    // -------------------------------------------------------------------------
+    // Fields by name
+    // -------------------------------------------------------------------------
+
     public void longField(String name, long value) {
-        column(name).setLong(docCount, value);
+        longField(declareField(name), value);
     }
 
     public void doubleField(String name, double value) {
-        column(name).setDouble(docCount, value);
+        doubleField(declareField(name), value);
     }
 
     public void booleanField(String name, boolean value) {
-        column(name).setBoolean(docCount, value);
+        booleanField(declareField(name), value);
     }
 
     public void stringField(String name, byte[] bytes, int offset, int length) {
-        column(name).setString(docCount, bytes, offset, length);
+        stringField(declareField(name), bytes, offset, length);
     }
 
-    /** Writes a long that is the same in every row of the open block; only valid in the first row of the block. */
-    public void blockLongField(String name, long value) {
-        blockColumn(name).setLongRepeated(docCount, value, blockRows);
-    }
+    // -------------------------------------------------------------------------
+    // Fields by handle
+    // -------------------------------------------------------------------------
 
-    public void blockDoubleField(String name, double value) {
-        blockColumn(name).setDoubleRepeated(docCount, value, blockRows);
-    }
-
-    public void blockBooleanField(String name, boolean value) {
-        blockColumn(name).setBooleanRepeated(docCount, value, blockRows);
-    }
-
-    public void blockStringField(String name, byte[] bytes, int offset, int length) {
-        blockColumn(name).setStringRepeated(docCount, bytes, offset, length, blockRows);
-    }
-
-    private EscfColumnBuilder blockColumn(String name) {
-        if (blockRows == 0 || docCount != blockStart) {
-            throw new IllegalStateException("block fields can only be written in the first row of a block");
+    /**
+     * Declares the leaf {@code name} of the current object, if it is not part of the schema yet, and returns its handle. Nothing
+     * is written; the handle is valid for the lifetime of this builder, independent of the object the cursor is in later.
+     */
+    public int declareField(String name) {
+        int leaf = schema.appendLeaf(name, parentStack[parentDepth]);
+        ensureLeaf(leaf);
+        if (leafNames[leaf] == null) {
+            leafNames[leaf] = name.getBytes(StandardCharsets.UTF_8);
+            insertLeafLookup(leaf);
         }
-        return column(name);
+        return leaf;
+    }
+
+    /**
+     * Same as {@link #declareField(String)} for a name given as UTF-8 bytes. The name is only materialized as a string the first
+     * time it is seen under the current object.
+     */
+    public int declareField(byte[] name, int offset, int length) {
+        final int parent = parentStack[parentDepth];
+        final int mask = leafLookup.length - 1;
+        int slot = StringHelper.murmurhash3_x86_32(name, offset, length, parent) & mask;
+        int entry;
+        while ((entry = leafLookup[slot]) != 0) {
+            final int leaf = entry - 1;
+            final byte[] leafName = leafNames[leaf];
+            if (schema.getLeafParent(leaf) == parent && Arrays.equals(leafName, 0, leafName.length, name, offset, offset + length)) {
+                return leaf;
+            }
+            slot = (slot + 1) & mask;
+        }
+        return declareField(new String(name, offset, length, StandardCharsets.UTF_8));
+    }
+
+    /** Writes a long into the current row of the declared field {@code field}. */
+    public void longField(int field, long value) {
+        rowColumn(field).setLong(docCount, value);
+    }
+
+    public void doubleField(int field, double value) {
+        rowColumn(field).setDouble(docCount, value);
+    }
+
+    public void booleanField(int field, boolean value) {
+        rowColumn(field).setBoolean(docCount, value);
+    }
+
+    public void stringField(int field, byte[] bytes, int offset, int length) {
+        rowColumn(field).setString(docCount, bytes, offset, length);
+    }
+
+    /**
+     * Writes the same long into rows {@code [row, row + count)} of the declared field {@code field}. The rows may already be
+     * finished, but the field must not have been written in any of them, nor in a later row.
+     */
+    public void repeatedLongField(int field, int row, int count, long value) {
+        rangeColumn(field, row, count).setLongRepeated(row, value, count);
+    }
+
+    public void repeatedDoubleField(int field, int row, int count, double value) {
+        rangeColumn(field, row, count).setDoubleRepeated(row, value, count);
+    }
+
+    public void repeatedBooleanField(int field, int row, int count, boolean value) {
+        rangeColumn(field, row, count).setBooleanRepeated(row, value, count);
+    }
+
+    public void repeatedStringField(int field, int row, int count, byte[] bytes, int offset, int length) {
+        rangeColumn(field, row, count).setStringRepeated(row, bytes, offset, length, count);
     }
 
     /** The number of rows written, including the one in progress if it has been finished. */
@@ -169,7 +214,6 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
      * owns the column buffers.
      */
     public EscfBatch build() {
-        assert blockRows == 0 : "a block of [" + blockRows + "] rows was not completed";
         int leafCount = schema.leafCount();
         EscfColumnData[] columns = new EscfColumnData[leafCount];
         for (int c = 0; c < leafCount; c++) {
@@ -185,20 +229,63 @@ public final class OtlpMetricsBatchBuilder implements Releasable {
         builders.clear();
     }
 
-    /** The column builder of the leaf {@code name} in the current object, for a write starting at row {@code docCount}. */
-    private EscfColumnBuilder column(String name) {
-        int colIdx = schema.appendLeaf(name, parentStack[parentDepth]);
-        if (colIdx >= writtenInRow.length) {
-            writtenInRow = Arrays.copyOf(writtenInRow, Math.max(colIdx + 1, writtenInRow.length * 2));
+    /** The column builder of {@code field} for a write to the current row, rejecting a second write to it within the row. */
+    private EscfColumnBuilder rowColumn(int field) {
+        if (writtenInRow[field] == docCount + 1) {
+            throw new IllegalArgumentException("Duplicate field [" + schema.getLeafName(field) + "]");
         }
-        if (writtenInRow[colIdx] == docCount + 1) {
-            throw new IllegalArgumentException("Duplicate field [" + name + "]");
+        writtenInRow[field] = docCount + 1;
+        return builders.get(field);
+    }
+
+    /** The column builder of {@code field} for a write to rows {@code [row, row + count)}. */
+    private EscfColumnBuilder rangeColumn(int field, int row, int count) {
+        if (count <= 0 || row < 0 || row + count > docCount + 1) {
+            throw new IllegalArgumentException("rows [" + row + ", " + (row + count) + ") are not within the batch");
         }
-        writtenInRow[colIdx] = docCount + 1;
+        if (writtenInRow[field] >= row + 1) {
+            throw new IllegalArgumentException(
+                "Duplicate field [" + schema.getLeafName(field) + "]: already written in row " + (writtenInRow[field] - 1)
+            );
+        }
+        writtenInRow[field] = row + count;
+        return builders.get(field);
+    }
+
+    /** Makes sure the per-leaf tables and the builder list cover {@code leaf}. */
+    private void ensureLeaf(int leaf) {
+        if (leaf >= writtenInRow.length) {
+            int capacity = Math.max(leaf + 1, writtenInRow.length * 2);
+            writtenInRow = Arrays.copyOf(writtenInRow, capacity);
+            leafNames = Arrays.copyOf(leafNames, capacity);
+        }
         // Rows before the first one a column is written in are absent: the builder fills them in lazily.
-        while (builders.size() <= colIdx) {
+        while (builders.size() <= leaf) {
             builders.add(new EscfColumnBuilder(EscfColumnBuilder.CollisionPolicy.SPLIT, recycler, dictionaryStrings));
         }
-        return builders.get(colIdx);
+    }
+
+    private void insertLeafLookup(int leaf) {
+        if ((leafLookupSize + 1) * 2 > leafLookup.length) {
+            int[] old = leafLookup;
+            leafLookup = new int[old.length * 2];
+            for (int entry : old) {
+                if (entry != 0) {
+                    insertLeafLookupEntry(entry - 1);
+                }
+            }
+        }
+        insertLeafLookupEntry(leaf);
+        leafLookupSize++;
+    }
+
+    private void insertLeafLookupEntry(int leaf) {
+        final byte[] name = leafNames[leaf];
+        final int mask = leafLookup.length - 1;
+        int slot = StringHelper.murmurhash3_x86_32(name, 0, name.length, schema.getLeafParent(leaf)) & mask;
+        while (leafLookup[slot] != 0) {
+            slot = (slot + 1) & mask;
+        }
+        leafLookup[slot] = leaf + 1;
     }
 }
