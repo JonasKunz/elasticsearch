@@ -86,6 +86,8 @@ public class OTLPMetricsEscfComparisonRestIT extends ESRestTestCase {
         .setting("xpack.security.enabled", "false")
         .setting("xpack.ml.enabled", "false")
         .setting("xpack.watcher.enabled", "false")
+        // this test compares the per-metric field layout of both indexing paths
+        .setting("xpack.otel_data.escf.shared_metric_value_column", "false")
         .setting("indices.batch_indexing", "true")
         .build();
 

@@ -48,6 +48,8 @@ public abstract class AbstractOTLPIndexingRestIT extends ESRestTestCase {
         .setting("xpack.license.self_generated.type", "trial")
         .setting("xpack.ml.enabled", "false")
         .setting("xpack.watcher.enabled", "false")
+        // these tests assert the per-metric field layout
+        .setting("xpack.otel_data.escf.shared_metric_value_column", "false")
         .build();
 
     @Override

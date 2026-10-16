@@ -100,6 +100,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
     private final BatchIndexingEnabled batchIndexingEnabled;
     private final Recycler<BytesRef> bytesRefRecycler;
     private volatile boolean exemplarIngestionEnabled;
+    private volatile boolean sharedMetricValueColumn;
 
     @Inject
     public OTLPMetricsTransportAction(
@@ -118,6 +119,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
             defaultMappingHints = MappingHints.fromSettings(histogramFieldTypeSetting);
         });
         clusterSettings.initializeAndWatch(XPackSettings.METRIC_EXEMPLARS_ENABLED, enabled -> exemplarIngestionEnabled = enabled);
+        clusterSettings.initializeAndWatch(OTelPlugin.ESCF_SHARED_METRIC_VALUE_COLUMN, enabled -> sharedMetricValueColumn = enabled);
         this.clusterService = clusterService;
         this.batchIndexingEnabled = new BatchIndexingEnabled(clusterSettings);
         this.bytesRefRecycler = bigArrays.bytesRefRecycler();
@@ -231,7 +233,11 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
         if (batchIndexingEnabled.isEnabled() == false) {
             return null;
         }
-        MetricColumnarBuilder columnarBuilder = new MetricColumnarBuilder(defaultMappingHints, exemplarIngestionEnabled);
+        MetricColumnarBuilder columnarBuilder = new MetricColumnarBuilder(
+            defaultMappingHints,
+            exemplarIngestionEnabled,
+            sharedMetricValueColumn
+        );
         try (OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder(bytesRefRecycler, true)) {
             // Cheap early exit so that streams which can never take the ESCF path do not pay for writing a batch.
             MetricColumnarBuilder.Rows rows = columnarBuilder.buildRows(

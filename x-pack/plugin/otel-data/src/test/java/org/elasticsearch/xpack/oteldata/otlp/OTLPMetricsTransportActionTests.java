@@ -88,7 +88,12 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
         ClusterService clusterService = mock(ClusterService.class);
         clusterSettings = new ClusterSettings(
             Settings.EMPTY,
-            Set.of(OTelPlugin.HISTOGRAM_FIELD_TYPE_SETTING, BatchIndexingEnabled.BATCH_INDEXING, XPackSettings.METRIC_EXEMPLARS_ENABLED)
+            Set.of(
+                OTelPlugin.HISTOGRAM_FIELD_TYPE_SETTING,
+                OTelPlugin.ESCF_SHARED_METRIC_VALUE_COLUMN,
+                BatchIndexingEnabled.BATCH_INDEXING,
+                XPackSettings.METRIC_EXEMPLARS_ENABLED
+            )
         );
         when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
         ClusterState clusterState = ClusterState.builder(new ClusterName("test"))
