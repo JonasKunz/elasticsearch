@@ -148,12 +148,8 @@ public final class MetricColumnarBuilder {
     private static final String TEMPORALITY_DELTA_STRING = "delta";
     private static final String TEMPORALITY_CUMULATIVE_STRING = "cumulative";
 
-    /** Name of the column all metric values share when {@link #sharedMetricValueColumn} is set. */
-    public static final String SHARED_VALUE_FIELD = "value";
-
     private final MappingHints defaultMappingHints;
     private final boolean exemplarIngestionEnabled;
-    private final boolean sharedMetricValueColumn;
     private final BufferedMurmur3Hasher hasher = new BufferedMurmur3Hasher(0);
     // Data points of one metric arrive back to back, so remembering the last metric name avoids rehashing it.
     private String lastMetricName;
@@ -170,7 +166,6 @@ public final class MetricColumnarBuilder {
     private Predicate<String> targetSupported;
     private String target;
     private int firstRow;
-    private int sharedValueField;
     private List<IndexRequest> rowRequests;
     private long[] timestamps;
     private int numTimestamps;
@@ -180,18 +175,10 @@ public final class MetricColumnarBuilder {
      * @param exemplarIngestionEnabled whether exemplars are ingested as separate documents. Exemplar documents are
      *                                 only produced by the XContent path, so when this is {@code true} a data point
      *                                 that carries exemplars makes {@link #buildRows} return {@code null}.
-     * @param sharedMetricValueColumn  experimental: write every metric value, converted to double, into the single
-     *                                 {@code metrics.value} column instead of a column per metric name. The metric is
-     *                                 then only identifiable through {@code _metric_names_hash}.
      */
-    public MetricColumnarBuilder(MappingHints defaultMappingHints, boolean exemplarIngestionEnabled, boolean sharedMetricValueColumn) {
+    public MetricColumnarBuilder(MappingHints defaultMappingHints, boolean exemplarIngestionEnabled) {
         this.defaultMappingHints = defaultMappingHints;
         this.exemplarIngestionEnabled = exemplarIngestionEnabled;
-        this.sharedMetricValueColumn = sharedMetricValueColumn;
-    }
-
-    public MetricColumnarBuilder(MappingHints defaultMappingHints, boolean exemplarIngestionEnabled) {
-        this(defaultMappingHints, exemplarIngestionEnabled, false);
     }
 
     /**
@@ -224,7 +211,6 @@ public final class MetricColumnarBuilder {
         this.targetSupported = targetSupported;
         this.target = null;
         this.firstRow = batchBuilder.docCount();
-        this.sharedValueField = -1;
         this.rowRequests = new ArrayList<>();
         this.timestamps = new long[16];
         this.numTimestamps = 0;
@@ -532,18 +518,9 @@ public final class MetricColumnarBuilder {
             default -> null;
         };
         metric.namesHash = metricNamesHash(metric.name);
-        if (sharedMetricValueColumn) {
-            if (sharedValueField < 0) {
-                batchBuilder.startObject("metrics");
-                sharedValueField = batchBuilder.declareField(SHARED_VALUE_FIELD);
-                batchBuilder.endObject();
-            }
-            metric.valueField = sharedValueField;
-        } else {
-            batchBuilder.startObject("metrics");
-            metric.valueField = batchBuilder.declareField(metric.name);
-            batchBuilder.endObject();
-        }
+        batchBuilder.startObject("metrics");
+        metric.valueField = batchBuilder.declareField(metric.name);
+        batchBuilder.endObject();
 
         reader.pos = dataStart;
         while (reader.pos < dataEnd) {
@@ -660,15 +637,10 @@ public final class MetricColumnarBuilder {
         }
         var dynamicTemplates = Maps.<String, String>newHashMapWithExpectedSize(1);
         var dynamicTemplateParams = Maps.<String, Map<String, String>>newHashMapWithExpectedSize(1);
-        if (sharedMetricValueColumn) {
-            // one double gauge for all metrics; a per-metric unit or counter semantics cannot be expressed in its mapping
-            dynamicTemplates.put("metrics." + SHARED_VALUE_FIELD, "gauge_double");
-        } else {
-            String metricFieldPath = "metrics." + metric.name;
-            dynamicTemplates.put(metricFieldPath, metric.dynamicTemplatePrefix + (isDouble ? "double" : "long"));
-            if (metric.unit != null) {
-                dynamicTemplateParams.put(metricFieldPath, Map.of(OTelTsdbDocumentBuilder.UNIT_FIELD, metric.unit));
-            }
+        String metricFieldPath = "metrics." + metric.name;
+        dynamicTemplates.put(metricFieldPath, metric.dynamicTemplatePrefix + (isDouble ? "double" : "long"));
+        if (metric.unit != null) {
+            dynamicTemplateParams.put(metricFieldPath, Map.of(OTelTsdbDocumentBuilder.UNIT_FIELD, metric.unit));
         }
         rowRequests.add(
             new IndexRequest(target).opType(DocWriteRequest.OpType.CREATE)
@@ -737,8 +709,6 @@ public final class MetricColumnarBuilder {
 
         if (isDouble) {
             batchBuilder.doubleField(metric.valueField, Double.longBitsToDouble(valueBits));
-        } else if (sharedMetricValueColumn) {
-            batchBuilder.doubleField(metric.valueField, (double) valueBits);
         } else {
             batchBuilder.longField(metric.valueField, valueBits);
         }

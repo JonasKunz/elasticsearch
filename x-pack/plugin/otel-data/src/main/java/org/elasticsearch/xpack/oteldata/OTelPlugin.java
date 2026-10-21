@@ -59,19 +59,6 @@ public class OTelPlugin extends Plugin implements ActionPlugin {
         Setting.Property.Dynamic
     );
 
-    /**
-     * Experimental: when enabled, the columnar (ESCF) metrics path stores the value of every number data point in the single
-     * shared {@code metrics.value} double column instead of a column per metric name. This trades one dense column for many
-     * sparse ones; queries that address metrics by field name do not work with it. Enabled by default on this benchmarking
-     * branch so that CI benchmark clusters, which cannot set node settings, exercise it.
-     */
-    public static final Setting<Boolean> ESCF_SHARED_METRIC_VALUE_COLUMN = Setting.boolSetting(
-        "xpack.otel_data.escf.shared_metric_value_column",
-        true,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic
-    );
-
     private static final Logger logger = LogManager.getLogger(OTelPlugin.class);
 
     private final SetOnce<OTelIndexTemplateRegistry> registry = new SetOnce<>();
@@ -132,7 +119,7 @@ public class OTelPlugin extends Plugin implements ActionPlugin {
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(OTEL_DATA_REGISTRY_ENABLED, HISTOGRAM_FIELD_TYPE_SETTING, ESCF_SHARED_METRIC_VALUE_COLUMN);
+        return List.of(OTEL_DATA_REGISTRY_ENABLED, HISTOGRAM_FIELD_TYPE_SETTING);
     }
 
     @Override

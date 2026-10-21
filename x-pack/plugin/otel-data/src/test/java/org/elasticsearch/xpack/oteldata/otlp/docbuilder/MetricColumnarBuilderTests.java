@@ -505,53 +505,6 @@ public class MetricColumnarBuilderTests extends ESTestCase {
     }
 
     /**
-     * With the experimental shared value column, every data point's value lands in {@code metrics.value} as a double, no
-     * per-metric column exists, and every row requests the same dynamic template for that one field.
-     */
-    public void testSharedMetricValueColumn() throws Exception {
-        ExportMetricsServiceRequest request = ExportMetricsServiceRequest.newBuilder()
-            .addResourceMetrics(
-                createResourceMetrics(
-                    List.of(keyValue("service.name", "svc")),
-                    List.of(
-                        createScopeMetrics(
-                            "s",
-                            "1",
-                            List.of(
-                                createGaugeMetric("cpu", "1", List.of(createDoubleDataPoint(nowNanos))),
-                                createGaugeMetric("mem", "By", List.of(createLongDataPoint(nowNanos)))
-                            )
-                        )
-                    )
-                )
-            )
-            .build();
-        long expectedMem = request.getResourceMetrics(0).getScopeMetrics(0).getMetrics(1).getGauge().getDataPoints(0).getAsInt();
-        double expectedCpu = request.getResourceMetrics(0).getScopeMetrics(0).getMetrics(0).getGauge().getDataPoints(0).getAsDouble();
-
-        MetricColumnarBuilder shared = new MetricColumnarBuilder(MappingHints.DEFAULT_EXPONENTIAL_HISTOGRAM, false, true);
-        OtlpMetricsBatchBuilder batchBuilder = new OtlpMetricsBatchBuilder();
-        MetricColumnarBuilder.Rows rows = shared.buildRows(batchBuilder, new BytesArray(request.toByteArray()), target -> true);
-        assertNotNull(rows);
-        assertEquals(2, rows.rowRequests().size());
-        for (var rowRequest : rows.rowRequests()) {
-            assertEquals(java.util.Map.of("metrics.value", "gauge_double"), rowRequest.getDynamicTemplates());
-        }
-
-        EscfBatch batch = batchBuilder.build();
-        assertEquals(List.of(expectedCpu, (double) expectedMem), readDoubleColumn(batch, "metrics.value"));
-        SourceSchema schema = batch.schema();
-        for (int i = 0; i < schema.leafCount(); i++) {
-            assertFalse(schema.getFullPath(i), schema.getFullPath(i).equals("metrics.cpu") || schema.getFullPath(i).equals("metrics.mem"));
-        }
-        assertEquals(
-            "the metric is still told apart by its names hash",
-            2,
-            new java.util.HashSet<>(readStringColumn(batch, "_metric_names_hash")).size()
-        );
-    }
-
-    /**
      * Protobuf does not prescribe the order of fields on the wire. The Java runtime writes them in ascending field number order,
      * but the Go runtime used by the OpenTelemetry Collector writes them in descending order: a metric's data points precede its
      * temporality, unit and name, a scope's metrics precede the scope itself. The streaming parser must produce the same batch
