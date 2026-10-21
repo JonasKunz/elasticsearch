@@ -22,11 +22,10 @@ public class OtlpMetricsBatchBuilderTests extends ESTestCase {
     }
 
     /**
-     * Writes {@code blocks} blocks of resource/scope-like fields followed by per-row fields. With {@code deferred} the shared fields
-     * are declared in the block's first row and written once for the whole block after its last row, the way the streaming builder
-     * does when it does not know the row count in advance; otherwise they are written in every row. Both must produce the same batch.
+     * Writes {@code blocks} blocks of resource/scope-like fields followed by per-row fields. With {@code useBlocks} the shared fields
+     * are written once per block, otherwise in every row; both must produce the same batch.
      */
-    private static EscfBatch write(boolean deferred, long seed, boolean dictionaryStrings) {
+    private static EscfBatch write(boolean useBlocks, long seed, boolean dictionaryStrings) {
         Random random = new Random(seed);
         try (OtlpMetricsBatchBuilder builder = new OtlpMetricsBatchBuilder(BytesRefRecycler.NON_RECYCLING_INSTANCE, dictionaryStrings)) {
             int blocks = 1 + random.nextInt(5);
@@ -39,39 +38,26 @@ public class OtlpMetricsBatchBuilderTests extends ESTestCase {
                 boolean flag = random.nextBoolean();
                 // sometimes the shared long column of one block becomes a string in another one, forcing a union column
                 boolean portAsString = random.nextInt(4) == 0;
-                int serviceField = -1, hostField = -1, portField = -1, ratioField = -1, flagField = -1;
-                int firstRow = builder.docCount();
+                if (useBlocks) {
+                    builder.beginBlock(rows);
+                }
                 for (int r = 0; r < rows; r++) {
                     builder.beginRow();
                     builder.longField("@timestamp", 1_000L * b + r);
-                    if (deferred && r == 0) {
-                        // declared where the per-row variant first writes them, so that both schemas list the leaves in the same order
+                    if (useBlocks == false || r == 0) {
                         builder.startObject("resource");
                         builder.startObject("attributes");
-                        serviceField = builder.declareField("service.name");
+                        write(builder, useBlocks, "service.name", service);
                         if (hasHost) {
-                            hostField = declareByBytes(builder, "host.name");
-                        }
-                        portField = declareByBytes(builder, "port");
-                        ratioField = builder.declareField("ratio");
-                        flagField = builder.declareField("flag");
-                        builder.endObject();
-                        builder.endObject();
-                    }
-                    if (deferred == false) {
-                        builder.startObject("resource");
-                        builder.startObject("attributes");
-                        write(builder, "service.name", service);
-                        if (hasHost) {
-                            write(builder, "host.name", "host-" + b);
+                            write(builder, useBlocks, "host.name", "host-" + b);
                         }
                         if (portAsString) {
-                            write(builder, "port", "p" + port);
+                            write(builder, useBlocks, "port", "p" + port);
                         } else {
-                            builder.longField("port", port);
+                            write(builder, useBlocks, "port", port);
                         }
-                        builder.doubleField("ratio", ratio);
-                        builder.booleanField("flag", flag);
+                        write(builder, useBlocks, "ratio", ratio);
+                        write(builder, useBlocks, "flag", flag);
                         builder.endObject();
                         builder.endObject();
                     }
@@ -85,64 +71,54 @@ public class OtlpMetricsBatchBuilderTests extends ESTestCase {
                     builder.endObject();
                     builder.finishRow();
                 }
-                if (deferred) {
-                    writeRepeated(builder, serviceField, firstRow, rows, service);
-                    if (hasHost) {
-                        writeRepeated(builder, hostField, firstRow, rows, "host-" + b);
-                    }
-                    if (portAsString) {
-                        writeRepeated(builder, portField, firstRow, rows, "p" + port);
-                    } else {
-                        builder.repeatedLongField(portField, firstRow, rows, port);
-                    }
-                    builder.repeatedDoubleField(ratioField, firstRow, rows, ratio);
-                    builder.repeatedBooleanField(flagField, firstRow, rows, flag);
-                }
             }
             return builder.build();
         }
     }
 
-    private static int declareByBytes(OtlpMetricsBatchBuilder builder, String name) {
-        // surround the name with garbage to exercise the offset/length handling of the lookup by bytes
-        byte[] bytes = utf8("xx" + name + "yy");
-        return builder.declareField(bytes, 2, bytes.length - 4);
-    }
-
-    private static void write(OtlpMetricsBatchBuilder builder, String name, String value) {
+    private static void write(OtlpMetricsBatchBuilder builder, boolean block, String name, String value) {
         byte[] bytes = utf8(value);
-        builder.stringField(name, bytes, 0, bytes.length);
-    }
-
-    private static void writeRepeated(OtlpMetricsBatchBuilder builder, int field, int firstRow, int rows, String value) {
-        byte[] bytes = utf8(value);
-        builder.repeatedStringField(field, firstRow, rows, bytes, 0, bytes.length);
-    }
-
-    public void testDeferredRepeatedFieldsEqualPerRowFields() {
-        for (boolean dictionaryStrings : new boolean[] { true, false }) {
-            for (int i = 0; i < 50; i++) {
-                long seed = randomLong();
-                try (EscfBatch deferred = write(true, seed, dictionaryStrings); EscfBatch rows = write(false, seed, dictionaryStrings)) {
-                    assertEquals(rows.docCount(), deferred.docCount());
-                    BytesReference expected = rows.data();
-                    assertEquals("seed " + seed, expected, deferred.data());
-                }
-            }
+        if (block) {
+            builder.blockStringField(name, bytes, 0, bytes.length);
+        } else {
+            builder.stringField(name, bytes, 0, bytes.length);
         }
     }
 
-    public void testDeclareFieldByBytesFindsExistingLeaf() {
-        try (OtlpMetricsBatchBuilder builder = new OtlpMetricsBatchBuilder()) {
-            int byName = builder.declareField("host.name");
-            assertEquals(byName, declareByBytes(builder, "host.name"));
-            assertEquals(byName, builder.declareField("host.name"));
-            builder.startObject("resource");
-            int nested = declareByBytes(builder, "host.name");
-            assertNotEquals("same name under another parent is another leaf", byName, nested);
-            assertEquals(nested, builder.declareField("host.name"));
-            builder.endObject();
-            assertEquals(byName, declareByBytes(builder, "host.name"));
+    private static void write(OtlpMetricsBatchBuilder builder, boolean block, String name, long value) {
+        if (block) {
+            builder.blockLongField(name, value);
+        } else {
+            builder.longField(name, value);
+        }
+    }
+
+    private static void write(OtlpMetricsBatchBuilder builder, boolean block, String name, double value) {
+        if (block) {
+            builder.blockDoubleField(name, value);
+        } else {
+            builder.doubleField(name, value);
+        }
+    }
+
+    private static void write(OtlpMetricsBatchBuilder builder, boolean block, String name, boolean value) {
+        if (block) {
+            builder.blockBooleanField(name, value);
+        } else {
+            builder.booleanField(name, value);
+        }
+    }
+
+    public void testBlockFieldsEqualPerRowFields() {
+        for (boolean dictionaryStrings : new boolean[] { true, false }) {
+            for (int i = 0; i < 50; i++) {
+                long seed = randomLong();
+                try (EscfBatch blocks = write(true, seed, dictionaryStrings); EscfBatch rows = write(false, seed, dictionaryStrings)) {
+                    assertEquals(rows.docCount(), blocks.docCount());
+                    BytesReference expected = rows.data();
+                    assertEquals("seed " + seed, expected, blocks.data());
+                }
+            }
         }
     }
 
@@ -154,28 +130,22 @@ public class OtlpMetricsBatchBuilderTests extends ESTestCase {
         }
     }
 
-    public void testRepeatedFieldOverWrittenRowsIsRejected() {
+    public void testDuplicateBlockFieldIsRejected() {
         try (OtlpMetricsBatchBuilder builder = new OtlpMetricsBatchBuilder()) {
-            int a = builder.declareField("a");
+            builder.beginBlock(3);
             builder.beginRow();
-            builder.longField(a, 1);
-            builder.finishRow();
-            builder.beginRow();
-            builder.finishRow();
-            expectThrows(IllegalArgumentException.class, () -> builder.repeatedLongField(a, 0, 2, 2));
-            // rows after the written one are fine
-            builder.repeatedLongField(a, 1, 1, 2);
-            expectThrows(IllegalArgumentException.class, () -> builder.repeatedLongField(a, 1, 1, 3));
+            builder.blockLongField("a", 1);
+            expectThrows(IllegalArgumentException.class, () -> builder.blockLongField("a", 2));
         }
     }
 
-    public void testRepeatedFieldBeyondBatchIsRejected() {
+    public void testBlockFieldOutsideFirstRowIsRejected() {
         try (OtlpMetricsBatchBuilder builder = new OtlpMetricsBatchBuilder()) {
-            int a = builder.declareField("a");
+            builder.beginBlock(2);
             builder.beginRow();
             builder.finishRow();
-            expectThrows(IllegalArgumentException.class, () -> builder.repeatedLongField(a, 0, 3, 1));
-            expectThrows(IllegalArgumentException.class, () -> builder.repeatedLongField(a, 0, 0, 1));
+            builder.beginRow();
+            expectThrows(IllegalStateException.class, () -> builder.blockLongField("a", 1));
         }
     }
 }

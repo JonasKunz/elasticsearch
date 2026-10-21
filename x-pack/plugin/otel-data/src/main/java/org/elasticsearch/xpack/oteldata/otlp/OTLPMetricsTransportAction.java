@@ -27,7 +27,6 @@ import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.cluster.service.ClusterService;
-import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.common.settings.ClusterSettings;
@@ -134,17 +133,18 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
 
     @Override
     protected ProcessingContext prepareBulkRequest(OTLPActionRequest request, BulkRequestBuilder bulkRequestBuilder) throws IOException {
+        var metricsServiceRequest = ExportMetricsServiceRequest.parseFrom(request.getRequest().streamInput());
         ProjectMetadata projectMetadata = clusterService.state().projectState(ProjectId.DEFAULT).metadata();
         // Snapshot volatile setting to have it consistent for this request
         boolean exemplarIngestionEnabled = this.exemplarIngestionEnabled;
 
-        // Optimistic ESCF path: it streams the protobuf payload straight into the batch, one row per data point, without
-        // decoding it into message objects or grouping data points into documents first. Only cheap metadata checks happen
-        // up front; whether the payload is expressible as scalar columns is found out while writing it. On the first
-        // unsupported data point the batch is dropped and the whole request is parsed and written in doc-mode below.
+        // Optimistic ESCF path: it works directly on the parsed request, one row per data point, without grouping
+        // data points into documents first. Only cheap metadata checks happen up front; whether the payload is
+        // expressible as scalar columns is found out while writing it. On the first unsupported data point the
+        // batch is dropped and the whole request is written in doc-mode below.
         ProcessingContext escfContext = tryAddEscfBatch(
             bulkRequestBuilder,
-            request.getRequest(),
+            metricsServiceRequest,
             projectMetadata,
             exemplarIngestionEnabled
         );
@@ -152,7 +152,6 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
             return escfContext;
         }
 
-        var metricsServiceRequest = ExportMetricsServiceRequest.parseFrom(request.getRequest().streamInput());
         BufferedByteStringAccessor byteStringAccessor = new BufferedByteStringAccessor();
         DataPointGroupingContext context = new DataPointGroupingContext(byteStringAccessor, defaultMappingHints);
         context.groupDataPoints(metricsServiceRequest);
@@ -199,14 +198,12 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
     // -------------------------------------------------------------------------
 
     /**
-     * Optimistically writes every data point of the serialized {@code ExportMetricsServiceRequest} {@code payload} as one
-     * row of a single {@link EscfBatch} and registers the batch, together with one {@link IndexRequest} per row, on
-     * {@code bulkRequestBuilder}.
+     * Optimistically writes every data point of {@code request} as one row of a single {@link EscfBatch} and
+     * registers the batch, together with one {@link IndexRequest} per row, on {@code bulkRequestBuilder}.
      *
-     * <p>This deliberately bypasses the protobuf message objects and {@link DataPointGroupingContext}: decoding the
-     * request into objects copies every string once more, and grouping data points that share resource, scope,
-     * attributes and timestamp into one document rarely combines several metrics, but costs hashing and map lookups for
-     * every data point. Rows are therefore written in request order, one per data point, straight from the wire format.
+     * <p>This deliberately bypasses {@link DataPointGroupingContext}: grouping data points that share resource,
+     * scope, attributes and timestamp into one document rarely combines several metrics, but costs hashing and
+     * map lookups for every data point. Rows are therefore written in request order, one per data point.
      *
      * <p>Returns {@code null} without modifying {@code bulkRequestBuilder} when the request cannot be written
      * this way: batch indexing is disabled, the target data stream does not exist or does not support batch
@@ -224,7 +221,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
     @Nullable
     ProcessingContext tryAddEscfBatch(
         BulkRequestBuilder bulkRequestBuilder,
-        BytesReference payload,
+        ExportMetricsServiceRequest request,
         ProjectMetadata projectMetadata,
         boolean exemplarIngestionEnabled
     ) throws IOException {
@@ -236,7 +233,7 @@ public class OTLPMetricsTransportAction extends AbstractOTLPTransportAction {
             // Cheap early exit so that streams which can never take the ESCF path do not pay for writing a batch.
             MetricColumnarBuilder.Rows rows = columnarBuilder.buildRows(
                 batchBuilder,
-                payload,
+                request,
                 target -> writeIndexSupportsEscf(projectMetadata, target)
             );
             if (rows == null) {

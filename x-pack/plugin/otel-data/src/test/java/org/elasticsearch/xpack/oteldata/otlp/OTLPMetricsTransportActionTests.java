@@ -730,7 +730,7 @@ public class OTLPMetricsTransportActionTests extends AbstractOTLPTransportAction
         BulkRequestBuilder bulkRequestBuilder = new BulkRequestBuilder(client);
         AbstractOTLPTransportAction.ProcessingContext context = metricsAction.tryAddEscfBatch(
             bulkRequestBuilder,
-            new BytesArray(request.toByteArray()),
+            request,
             projectMetadata,
             exemplarIngestionEnabled
         );
