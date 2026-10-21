@@ -1398,7 +1398,9 @@ public class InternalEngine extends Engine {
                 }
                 if (index.origin().isFromTranslog() == false) {
                     final Translog.Location location;
-                    if (indexResult.getResultType() == Result.Type.SUCCESS) {
+                    if (BENCHMARK_SKIP_TRANSLOG) {
+                        location = null;
+                    } else if (indexResult.getResultType() == Result.Type.SUCCESS) {
                         location = translog.add(new Translog.Index(index, indexResult));
                     } else if (indexResult.getSeqNo() != UNASSIGNED_SEQ_NO) {
                         // if we have document failure, record it as a no-op in the translog and Lucene with the generated seq_no
@@ -1812,7 +1814,9 @@ public class InternalEngine extends Engine {
                         rowStatuses[i] = IndexOperationBatch.TranslogRecord.ROW_PREFLIGHT_ERROR;
                     }
                 }
-                batchLocation = translogOps == 0 ? null : translog.add(subBatch.toTranslogRecord(rowStatuses, noOpReasons));
+                batchLocation = translogOps == 0 || BENCHMARK_SKIP_TRANSLOG
+                    ? null
+                    : translog.add(subBatch.toTranslogRecord(rowStatuses, noOpReasons));
             } else {
                 batchLocation = null;
             }
@@ -3519,6 +3523,16 @@ public class InternalEngine extends Engine {
 
     private static final boolean SHUFFLE_FORCE_MERGE = Booleans.parseBoolean(
         System.getProperty("es.shuffle_forced_merge", Boolean.TRUE.toString())
+    );
+
+    /**
+     * BENCHMARK ONLY: skips writing index operations to the translog entirely. Indexed data is NOT durable
+     * until the next Lucene commit and cannot be recovered or replicated. Enabled by default on this
+     * benchmarking branch so that CI images (which cannot easily pass JVM flags) pick it up; set
+     * {@code -Des.benchmark.skip_translog=false} to restore normal translog writes.
+     */
+    private static final boolean BENCHMARK_SKIP_TRANSLOG = Booleans.parseBoolean(
+        System.getProperty("es.benchmark.skip_translog", Boolean.TRUE.toString())
     );
 
     private IndexWriterConfig getIndexWriterConfig() {
